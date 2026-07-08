@@ -27,6 +27,7 @@ isn't on PyPI. GPU with CUDA is strongly recommended for Steps 3/5/6.
 | 4. Discretize | `src/discretization.py extract / sweep / fit` | Extract syllable-mean-pooled embeddings, sweep K, fit final k-means vocabulary |
 | — | `src/tokenizer.py encode` | End-to-end: raw wav -> discrete token IDs, via the fitted encoder + k-means |
 | 5/6. SLM | `src/train_slm.py encode / train` | Encode a manifest to token sequences, continue-pretrain OPT-125M on them, report perplexity |
+| — | `src/encoders.py`, `src/compare_encoders.py` | HuBERT/Whisper baseline encoder adapters + a table comparing perplexity/token-rate across encoders (see "Benchmarking" below) |
 
 Example end-to-end run:
 
@@ -42,15 +43,46 @@ python src/segmentation.py finetune --manifest data/preprocessing/manifests/khme
     --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
 
 python src/discretization.py extract --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
-    --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth --out data/embeddings/khmer_syllable_embeddings
-python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings
-python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings --k 10000 \
+    --encoder sylber --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth --out data/embeddings/sylber
+python src/discretization.py sweep --embeddings data/embeddings/sylber
+python src/discretization.py fit --embeddings data/embeddings/sylber --k 10000 \
     --out models/khmer_kmeans_10k.pkl
 
 python src/train_slm.py encode --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
-    --out data/tokens/khmer_tokens.jsonl
-python src/train_slm.py train --tokens data/tokens/khmer_tokens.jsonl
+    --encoder sylber --out data/tokens/sylber_tokens.jsonl
+python src/train_slm.py train --tokens data/tokens/sylber_tokens.jsonl --encoder sylber
 ```
+
+## Benchmarking against other encoders
+
+`src/encoders.py` adds HuBERT and Whisper (frame-level, no syllable
+segmentation) as drop-in alternatives to Sylber for the same discretize ->
+SLM pipeline, so they can be compared head-to-head on token rate and
+perplexity (Step 5's "Baseline Comparison" in the doc). Repeat the
+discretize/encode/train steps above once per encoder:
+
+```bash
+for enc in sylber hubert whisper; do
+    python src/discretization.py extract --manifest <manifest.csv> --encoder $enc --out data/embeddings/$enc
+    python src/discretization.py sweep --embeddings data/embeddings/$enc
+    python src/discretization.py fit --embeddings data/embeddings/$enc --k 10000 --out models/${enc}_kmeans_10k.pkl
+
+    python src/train_slm.py encode --manifest <manifest.csv> --encoder $enc --kmeans-path models/${enc}_kmeans_10k.pkl \
+        --out data/tokens/${enc}_tokens.jsonl
+    python src/train_slm.py train --tokens data/tokens/${enc}_tokens.jsonl --encoder $enc
+done
+
+python src/compare_encoders.py --encoders sylber hubert whisper
+# -> results/downstream_eval/encoder_comparison.{csv,md}
+```
+
+HuBERT/Whisper default to `facebook/hubert-base-ls960` / `openai/whisper-base`
+(see `configs/tokenizer_config.yaml: baseline_encoders`); override per-run
+with `--checkpoint` on `extract`/`encode`. Note these two baselines have no
+notion of syllable boundaries — their embeddings are raw frame-level
+features (~50 Hz) fed through the same k-means step, so the comparison is
+"syllable tokens vs. discretized frame tokens," matching how the doc's Step 5
+baseline (HuBERT at 25-50 Hz) is meant to be read against Sylber's 4-5 Hz.
 
 ## Config
 

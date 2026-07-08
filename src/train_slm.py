@@ -1,18 +1,27 @@
-"""Steps 5/6: Train a Khmer Spoken Language Model on Sylber token sequences.
+"""Steps 5/6: Train a Khmer Spoken Language Model on discrete speech tokens.
 
 Reuses a pretrained OPT-125M/Qwen2.5-0.5B checkpoint but replaces its
 text vocabulary/embedding + LM head with one sized to the speech-token
 vocabulary (k-means K + special tokens), then continues pretraining via
 next-token prediction over token ID sequences (no text supervision).
 
-Usage:
-    # 1) encode a manifest's audio into token sequences
-    python src/train_slm.py encode --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
-        --out data/tokens/khmer_tokens.jsonl
+`--encoder` selects which tokenizer produced the tokens (sylber/hubert/
+whisper — see encoders.py and discretization.py), so the same script drives
+the SLM-benchmark comparison in src/compare_encoders.py: each encoder gets
+its own token file, output_dir, and results/downstream_eval/slm_eval_<encoder>.json.
 
-    # 2) train
-    python src/train_slm.py train --tokens data/tokens/khmer_tokens.jsonl \
-        --config configs/tokenizer_config.yaml
+Usage:
+    # 1) encode a manifest's audio into token sequences (per encoder)
+    python src/train_slm.py encode --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
+        --encoder sylber --out data/tokens/sylber_tokens.jsonl
+    python src/train_slm.py encode --manifest <manifest.csv> --encoder hubert --out data/tokens/hubert_tokens.jsonl
+    python src/train_slm.py encode --manifest <manifest.csv> --encoder whisper --out data/tokens/whisper_tokens.jsonl
+
+    # 2) train (once per encoder)
+    python src/train_slm.py train --tokens data/tokens/sylber_tokens.jsonl --encoder sylber
+
+    # 3) compare
+    python src/compare_encoders.py --encoders sylber hubert whisper
 """
 from __future__ import annotations
 
@@ -36,12 +45,26 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 def cmd_encode(args):
-    from tokenizer import KhmerSyllableTokenizer
+    cfg = yaml.safe_load(Path(args.config).read_text())
 
-    tok = KhmerSyllableTokenizer.from_config(args.config, use_khmer_finetuned=not args.base_checkpoint)
+    if args.encoder == "sylber":
+        from tokenizer import KhmerSyllableTokenizer
+
+        tok = KhmerSyllableTokenizer.from_config(args.config, use_khmer_finetuned=not args.base_checkpoint)
+    else:
+        from encoders import SpeechTokenizer
+
+        kmeans_path = args.kmeans_path or f"models/{args.encoder}_kmeans_10k.pkl"
+        tok = SpeechTokenizer(
+            encoder_name=args.encoder,
+            kmeans_path=kmeans_path,
+            checkpoint=args.checkpoint,
+            special_tokens=cfg["slm"]["special_tokens"],
+        )
+
     df = pd.read_csv(args.manifest)
 
-    out_path = Path(args.out)
+    out_path = Path(args.out or f"data/tokens/{args.encoder}_tokens.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     total_tokens = 0
@@ -128,8 +151,14 @@ def cmd_train(args):
 
     cfg = yaml.safe_load(Path(args.config).read_text())
     slm_cfg = cfg["slm"]
-    vocab_size = slm_cfg["vocab_size"] + len(slm_cfg["special_tokens"])
+    # Different encoders' k-means fits can land on different K (each is
+    # swept independently in discretization.py); --vocab-size lets the
+    # benchmark match each encoder's actual fitted vocabulary instead of
+    # assuming they all share the config's default K.
+    base_vocab_size = args.vocab_size if args.vocab_size is not None else slm_cfg["vocab_size"]
+    vocab_size = base_vocab_size + len(slm_cfg["special_tokens"])
     pad_id = slm_cfg["special_tokens"]["pad"]
+    output_dir = args.output_dir or f"{slm_cfg['output_dir']}_{args.encoder}"
 
     model, block_size = build_speech_lm(slm_cfg["base_model"], vocab_size, slm_cfg["max_seq_len"])
 
@@ -138,7 +167,7 @@ def cmd_train(args):
     log.info("train blocks=%d val blocks=%d (block_size=%d)", len(train_ds), len(val_ds), block_size)
 
     training_args = TrainingArguments(
-        output_dir=slm_cfg["output_dir"],
+        output_dir=output_dir,
         overwrite_output_dir=True,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -160,14 +189,16 @@ def cmd_train(args):
         eval_dataset=val_ds if len(val_ds) > 0 else None,
     )
     trainer.train()
-    trainer.save_model(slm_cfg["output_dir"])
-    log.info("Saved trained SLM to %s", slm_cfg["output_dir"])
+    trainer.save_model(output_dir)
+    log.info("Saved trained SLM to %s", output_dir)
 
     metrics = trainer.evaluate()
     perplexity = float(np.exp(metrics["eval_loss"])) if "eval_loss" in metrics else None
     results_path = Path("results/downstream_eval")
     results_path.mkdir(parents=True, exist_ok=True)
-    (results_path / "slm_eval.json").write_text(json.dumps({**metrics, "perplexity": perplexity}, indent=2))
+    (results_path / f"slm_eval_{args.encoder}.json").write_text(
+        json.dumps({**metrics, "perplexity": perplexity, "encoder": args.encoder, "vocab_size": base_vocab_size}, indent=2)
+    )
     log.info("Eval metrics: %s (perplexity=%s)", metrics, perplexity)
 
 
@@ -178,13 +209,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_encode = sub.add_parser("encode", help="encode a manifest's audio to a token-sequence JSONL")
     p_encode.add_argument("--manifest", required=True)
     p_encode.add_argument("--config", default="configs/tokenizer_config.yaml")
-    p_encode.add_argument("--out", default="data/tokens/khmer_tokens.jsonl")
-    p_encode.add_argument("--base-checkpoint", action="store_true")
+    p_encode.add_argument("--encoder", choices=["sylber", "hubert", "whisper"], default="sylber")
+    p_encode.add_argument("--checkpoint", default=None, help="encoder checkpoint/model-id override (hubert/whisper only; sylber uses --config/--base-checkpoint)")
+    p_encode.add_argument("--kmeans-path", default=None, help="defaults to models/<encoder>_kmeans_10k.pkl (hubert/whisper only; sylber uses --config)")
+    p_encode.add_argument("--out", default=None, help="default: data/tokens/<encoder>_tokens.jsonl")
+    p_encode.add_argument("--base-checkpoint", action="store_true", help="sylber only: use base pretrained Sylber instead of Khmer fine-tune")
     p_encode.set_defaults(func=cmd_encode)
 
     p_train = sub.add_parser("train", help="continued-pretrain the SLM on token sequences")
     p_train.add_argument("--tokens", required=True)
     p_train.add_argument("--config", default="configs/tokenizer_config.yaml")
+    p_train.add_argument("--encoder", choices=["sylber", "hubert", "whisper"], default="sylber", help="which encoder these tokens came from; controls output_dir/results filename")
+    p_train.add_argument("--vocab-size", type=int, default=None, help="override config's slm.vocab_size (e.g. if this encoder's k-means used a different K)")
+    p_train.add_argument("--output-dir", default=None, help="default: <config slm.output_dir>_<encoder>")
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--batch-size", type=int, default=8)
     p_train.add_argument("--lr", type=float, default=5e-5)

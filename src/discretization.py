@@ -1,5 +1,7 @@
-"""Step 4: Discretization — extract syllable-averaged embeddings and build
-a k-means token vocabulary.
+"""Step 4: Discretization — extract embeddings (syllable-pooled for Sylber,
+frame-level for HuBERT/Whisper baselines — see encoders.py) and build a
+k-means token vocabulary for each, so they can be compared head-to-head in
+the SLM benchmark (see src/compare_encoders.py).
 
 `extract` streams embeddings to sharded .npy files under --out (a directory)
 plus a meta.json, rather than holding the whole corpus (potentially tens of
@@ -9,13 +11,15 @@ embedding set resident in memory either.
 
 Usage:
     python src/discretization.py extract --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
-        --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth --out data/embeddings/khmer_syllable_embeddings
+        --encoder sylber --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth --out data/embeddings/sylber
+    python src/discretization.py extract --manifest <manifest.csv> --encoder hubert --out data/embeddings/hubert
+    python src/discretization.py extract --manifest <manifest.csv> --encoder whisper --out data/embeddings/whisper
 
-    python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings \
+    python src/discretization.py sweep --embeddings data/embeddings/sylber \
         --k-sweep 5000 10000 20000 40000
     # (reads shard list + total duration from the meta.json written by `extract`)
 
-    python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings \
+    python src/discretization.py fit --embeddings data/embeddings/sylber \
         --k 10000 --out models/khmer_kmeans_10k.pkl
 """
 from __future__ import annotations
@@ -44,30 +48,30 @@ log = logging.getLogger(__name__)
 SHARD_SIZE = 200_000  # syllables per shard file
 
 
-def iter_syllable_embeddings(manifest_path: str, checkpoint: str):
-    """Run the (fine-tuned) segmenter over every utterance and yield
-    (feats, duration_sec) per utterance without accumulating in RAM."""
-    from segmentation import load_segmenter  # local import: src/ on path
+def iter_embeddings(manifest_path: str, encoder_name: str, checkpoint: str | None):
+    """Run the chosen encoder over every utterance and yield (feats,
+    duration_sec) per utterance without accumulating in RAM. `feats` is
+    syllable-pooled for "sylber" and frame-level (native stride) for
+    "hubert"/"whisper" — see encoders.py."""
+    from encoders import load_encoder  # local import: src/ on path
 
-    segmenter = load_segmenter(checkpoint)
+    encoder = load_encoder(encoder_name, checkpoint=checkpoint)
     df = pd.read_csv(manifest_path)
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="extracting embeddings"):
-        out = segmenter(row["path"], in_second=True)
-        # sylber's Segmenter exposes both boundaries and the mean-pooled
-        # per-segment embedding (`segment_features`) when available.
+    for _, row in tqdm(df.iterrows(), total=len(df), desc=f"extracting {encoder_name} embeddings"):
+        out = encoder(row["path"], in_second=True)
         if isinstance(out, dict) and "segment_features" in out:
             feats = np.asarray(out["segment_features"])
         else:
             raise RuntimeError(
-                "Installed sylber version does not expose 'segment_features'; "
+                f"Installed {encoder_name} adapter does not expose 'segment_features'; "
                 "mean-pool 'features' over 'segments' boundaries manually."
             )
         yield feats, row["duration_sec"]
 
 
 def cmd_extract(args):
-    out_dir = Path(args.out)
+    out_dir = Path(args.out or f"data/embeddings/{args.encoder}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     shard_paths: list[str] = []
@@ -89,7 +93,7 @@ def cmd_extract(args):
         buffer = []
         buffer_n = 0
 
-    for feats, duration in iter_syllable_embeddings(args.manifest, args.checkpoint):
+    for feats, duration in iter_embeddings(args.manifest, args.encoder, args.checkpoint):
         if embedding_dim is None and feats.shape[0] > 0:
             embedding_dim = int(feats.shape[1])
         buffer.append(feats)
@@ -105,6 +109,7 @@ def cmd_extract(args):
     meta_path.write_text(
         json.dumps(
             {
+                "encoder": args.encoder,
                 "shards": shard_paths,
                 "n_syllables": n_syllables,
                 "embedding_dim": embedding_dim,
@@ -244,10 +249,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_extract = sub.add_parser("extract", help="extract syllable-mean-pooled embeddings (streamed to sharded .npy files)")
+    p_extract = sub.add_parser("extract", help="extract embeddings (syllable-pooled for sylber, frame-level for hubert/whisper), streamed to sharded .npy files")
     p_extract.add_argument("--manifest", required=True)
-    p_extract.add_argument("--checkpoint", default="sylber")
-    p_extract.add_argument("--out", default="data/embeddings/khmer_syllable_embeddings", help="output directory for shards + meta.json")
+    p_extract.add_argument("--encoder", choices=["sylber", "hubert", "whisper"], default="sylber")
+    p_extract.add_argument("--checkpoint", default=None, help="defaults to the base pretrained checkpoint/model-id for --encoder")
+    p_extract.add_argument("--out", default=None, help="output directory for shards + meta.json (default: data/embeddings/<encoder>)")
     p_extract.set_defaults(func=cmd_extract)
 
     p_sweep = sub.add_parser("sweep", help="sweep K for k-means and report cluster-balance metrics")

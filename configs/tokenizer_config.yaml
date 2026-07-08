@@ -38,3 +38,12 @@ slm:
   special_tokens: {pad: 10000, bos: 10001, eos: 10002}
   max_seq_len: 1024
   output_dir: models/khmer_slm_opt125m
+
+# Baseline encoders for the SLM benchmark (src/compare_encoders.py). Sylber
+# uses the segmenter/discretization sections above; these are HF checkpoints
+# for the frame-level baselines (see src/encoders.py). Override via
+# `discretization.py extract --checkpoint` / `train_slm.py encode --checkpoint`
+# if you want a different variant (e.g. a multilingual mHuBERT checkpoint).
+baseline_encoders:
+  hubert: facebook/hubert-base-ls960
+  whisper: openai/whisper-base
