@@ -71,12 +71,19 @@ class TokenSequenceDataset(Dataset):
                 if rec.get("split", "train") == split:
                     sequences.extend(rec["token_ids"])
 
-        n_blocks = max(len(sequences) // block_size, 0)
-        usable = n_blocks * block_size
-        if usable == 0:
+        n_full_blocks = len(sequences) // block_size
+        remainder = len(sequences) - n_full_blocks * block_size
+        if remainder:
+            # Pad the trailing partial block instead of silently dropping it.
+            sequences = sequences + [pad_id] * (block_size - remainder)
+            n_blocks = n_full_blocks + 1
+        else:
+            n_blocks = n_full_blocks
+
+        if n_blocks == 0:
             self.blocks = np.zeros((0, block_size), dtype=np.int64)
         else:
-            arr = np.asarray(sequences[:usable], dtype=np.int64)
+            arr = np.asarray(sequences, dtype=np.int64)
             self.blocks = arr.reshape(n_blocks, block_size)
         self.pad_id = pad_id
 
@@ -85,7 +92,9 @@ class TokenSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         ids = torch.from_numpy(self.blocks[idx].copy())
-        return {"input_ids": ids, "labels": ids.clone()}
+        labels = ids.clone()
+        labels[ids == self.pad_id] = -100  # ignored by CrossEntropyLoss
+        return {"input_ids": ids, "labels": labels}
 
 
 def build_speech_lm(base_model: str, vocab_size: int, max_seq_len: int) -> tuple["torch.nn.Module", int]:

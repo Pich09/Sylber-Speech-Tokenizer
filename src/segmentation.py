@@ -67,7 +67,15 @@ def run_segmentation(segmenter, wav_paths: list[str]) -> list[SegmentationResult
         out = segmenter(wav_path, in_second=True)
         # sylber returns {"segments": [(start, end), ...], "boundaries": [...]}
         # depending on version; normalize to a list of (start, end) tuples.
-        segments = out["segments"] if isinstance(out, dict) else out
+        if isinstance(out, dict):
+            if "segments" not in out:
+                raise RuntimeError(
+                    f"Installed sylber version's output has no 'segments' key (got keys={list(out.keys())}); "
+                    "adjust the marked spots in segmentation.py/discretization.py/tokenizer.py (search for 'segment_features')."
+                )
+            segments = out["segments"]
+        else:
+            segments = out
         results.append(SegmentationResult(path=wav_path, duration_sec=duration, segments=list(segments)))
     return results
 
@@ -241,9 +249,16 @@ def finetune_segmenter(
                 audio, sr = sf.read(wav_path, dtype="float32")
                 wav_tensor = torch.from_numpy(audio).unsqueeze(0).to(device)
 
-                hidden_states = backbone.extract_features(wav_tensor) if hasattr(
-                    backbone, "extract_features"
-                ) else backbone(wav_tensor).last_hidden_state
+                # head_only freezes backbone params, but without no_grad() autograd
+                # still builds a backward graph through its activations (needed to
+                # flow gradients into the head), costing nearly full_model VRAM.
+                backbone_ctx = torch.no_grad() if mode == "head_only" else torch.enable_grad()
+                with backbone_ctx:
+                    hidden_states = backbone.extract_features(wav_tensor) if hasattr(
+                        backbone, "extract_features"
+                    ) else backbone(wav_tensor).last_hidden_state
+                if mode == "head_only":
+                    hidden_states = hidden_states.detach()
 
                 logits = head(hidden_states)  # (1, T)
                 labels = frames_to_boundary_labels(segs, logits.shape[1], frame_stride_sec).to(device)

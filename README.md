@@ -42,9 +42,9 @@ python src/segmentation.py finetune --manifest data/preprocessing/manifests/khme
     --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
 
 python src/discretization.py extract --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
-    --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth --out data/embeddings/khmer_syllable_embeddings.npy
-python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings.npy
-python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings.npy --k 10000 \
+    --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth --out data/embeddings/khmer_syllable_embeddings
+python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings
+python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings --k 10000 \
     --out models/khmer_kmeans_10k.pkl
 
 python src/train_slm.py encode --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \

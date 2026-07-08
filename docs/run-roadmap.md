@@ -85,10 +85,16 @@ All commands below assume `cwd` = repo root, venv activated.
 
 4. **Discretization (Step 4)**:
    ```bash
-   python src/discretization.py extract --manifest <manifest.csv> --checkpoint <ckpt or "sylber"> --out data/embeddings/khmer_syllable_embeddings.npy
-   python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings.npy
-   python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings.npy --k 10000 --out models/khmer_kmeans_10k.pkl
+   python src/discretization.py extract --manifest <manifest.csv> --checkpoint <ckpt or "sylber"> --out data/embeddings/khmer_syllable_embeddings
+   python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings
+   python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings --k 10000 --out models/khmer_kmeans_10k.pkl
    ```
+   `--out`/`--embeddings` is a directory: `extract` streams embeddings to sharded
+   `shard_*.npy` files + `meta.json` under it instead of one giant in-memory array,
+   since the full corpus (~11.8M syllables per the roadmap doc's own estimate) would
+   otherwise risk OOM on a local RTX 4070 box. `sweep`/`fit` fit MiniBatchKMeans via
+   `partial_fit` over those shards.
+
    Confirm: `sweep`'s printed table should show ~4-5Hz token rate and no K with
    `top10_cluster_share > 0.5`; `fit` updates `selected_k`/`kmeans_model_path` in
    `configs/tokenizer_config.yaml` automatically (comments preserved).
