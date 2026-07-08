@@ -83,28 +83,77 @@ All commands below assume `cwd` = repo root, venv activated.
    Confirm: loss should trend down across epochs in the log; compare boundary agreement on a
    held-out set against the zero-shot baseline.
 
-4. **Discretization (Step 4)**:
+4. **Decision point — pick a path.** Once Step 2/3 boundary quality looks reasonable, choose
+   between two ways to spend GPU time, and note this is a *different* choice from step 3's
+   zero-shot-quality decision — step 3 only fixes *boundary detection*; the choice below is
+   about whether to validate the encoder choice before committing further, or commit directly:
+
+   - **Path A — compare Sylber against other encoders first** (cheaper, answers "is Sylber even
+     worth it for Khmer" before spending days fine-tuning it). Recommended to run on a small
+     manifest subset first (e.g. filter the manifest CSV to ~5-20h of audio) before the full
+     corpus — this whole path exists to be a cheap screening step, not a final result.
+   - **Path B — fine-tune Sylber directly, skip comparison** (go straight to the goal of a
+     reusable fine-tuned Khmer encoder, at the cost of not knowing whether a different encoder
+     would've done better).
+
+   Both are documented with full command sequences in the README's
+   ["Two paths after Step 2/3"](../README.md#two-paths-after-step-23) and
+   ["Benchmarking against other encoders"](../README.md#benchmarking-against-other-encoders)
+   sections — this roadmap just calls out the GPU-machine-specific notes for each:
+
+   **Path A (benchmark) — discretization + SLM training per encoder:**
    ```bash
-   python src/discretization.py extract --manifest <manifest.csv> --checkpoint <ckpt or "sylber"> --out data/embeddings/khmer_syllable_embeddings
-   python src/discretization.py sweep --embeddings data/embeddings/khmer_syllable_embeddings
-   python src/discretization.py fit --embeddings data/embeddings/khmer_syllable_embeddings --k 10000 --out models/khmer_kmeans_10k.pkl
+   for enc in sylber hubert whisper; do
+       python src/discretization.py extract --manifest <manifest.csv> --encoder $enc --out data/embeddings/$enc
+       python src/discretization.py sweep --embeddings data/embeddings/$enc
+       python src/discretization.py fit --embeddings data/embeddings/$enc --k 10000 --out models/${enc}_kmeans_10k.pkl
+
+       python src/train_slm.py encode --manifest <manifest.csv> --encoder $enc \
+           --kmeans-path models/${enc}_kmeans_10k.pkl --out data/tokens/${enc}_tokens.jsonl
+       python src/train_slm.py train --tokens data/tokens/${enc}_tokens.jsonl --encoder $enc
+   done
+   python src/compare_encoders.py --encoders sylber hubert whisper
    ```
    `--out`/`--embeddings` is a directory: `extract` streams embeddings to sharded
-   `shard_*.npy` files + `meta.json` under it instead of one giant in-memory array,
-   since the full corpus (~11.8M syllables per the roadmap doc's own estimate) would
-   otherwise risk OOM on a local RTX 4070 box. `sweep`/`fit` fit MiniBatchKMeans via
-   `partial_fit` over those shards.
+   `shard_*.npy` files + `meta.json` under it instead of one giant in-memory array, since the
+   full corpus (~11.8M syllables) would otherwise risk OOM on a local RTX 4070 box. `sweep`/`fit`
+   fit MiniBatchKMeans via `partial_fit` over those shards. If any encoder's k-means sweep picks
+   a K other than 10000, pass `train_slm.py train --vocab-size <that K>` — special (pad/bos/eos)
+   token IDs are derived from the actual K, not a fixed constant, so this must match.
 
-   Confirm: `sweep`'s printed table should show ~4-5Hz token rate and no K with
+   Confirm: `sweep`'s printed table should show ~4-5Hz token rate for sylber (HuBERT/Whisper will
+   read much higher, ~50Hz — expected, they have no syllable segmentation) and no K with
    `top10_cluster_share > 0.5`; `fit` updates `selected_k`/`kmeans_model_path` in
-   `configs/tokenizer_config.yaml` automatically (comments preserved).
+   `configs/tokenizer_config.yaml` in place (sylber run only — the other encoders' k-means paths
+   are tracked by their own `--out` filenames, not the shared config); `compare_encoders.py`
+   writes `results/downstream_eval/encoder_comparison.{csv,md}`.
 
-5. **SLM training (Steps 5/6)**:
+   **Path B (direct fine-tune) — full-model fine-tune + publish:**
    ```bash
-   python src/train_slm.py encode --manifest <manifest.csv> --out data/tokens/khmer_tokens.jsonl
-   python src/train_slm.py train --tokens data/tokens/khmer_tokens.jsonl
+   python src/segmentation.py finetune --manifest <manifest.csv> \
+       --boundaries data/annotations/corrected_boundaries.json --mode full_model \
+       --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
+
+   python src/publish_checkpoint.py --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth \
+       --repo-id Panhapich/syllber-based-audio-encoder --push
    ```
-   Confirm: `results/downstream_eval/slm_eval.json` gets written with `eval_loss` and
+   `--mode full_model` unfreezes the whole backbone (not just the boundary head), which is what
+   makes this different from step 3's conditional fine-tune even if step 3 was skipped because
+   zero-shot passed — step 3 is about fixing bad boundaries, this is about deliberately adapting
+   the encoder to Khmer acoustics for downstream reuse. `--push` needs `huggingface-cli login` or
+   an `HF_TOKEN` env var set on the GPU machine first; it creates the Hub repo **private** by
+   default (`--public` to change that). Note DDD-Cambodia is CC-BY-SA-4.0 — check share-alike
+   license implications before making a derived checkpoint public.
+
+   Confirm: fine-tune loss trending down in the epoch logs; `publish_checkpoint.py` logs the
+   local export dir and, if `--push`, the resulting `https://huggingface.co/<repo-id>` URL.
+
+5. **SLM training on the chosen/final encoder (Steps 5/6, if not already covered by Path A above)**:
+   ```bash
+   python src/train_slm.py encode --manifest <manifest.csv> --encoder sylber --out data/tokens/sylber_tokens.jsonl
+   python src/train_slm.py train --tokens data/tokens/sylber_tokens.jsonl --encoder sylber
+   ```
+   Confirm: `results/downstream_eval/slm_eval_sylber.json` gets written with `eval_loss` and
    `perplexity` after training completes.
 
 ## Summary: what to change vs. leave alone
@@ -114,11 +163,12 @@ All commands below assume `cwd` = repo root, venv activated.
 | Code (`src/*.py`, `configs/*.yaml`) | No changes, as long as `sylber`'s output keys match the `segment_features` assumption (verify with the one-line check in step 2) |
 | `requirements.txt` torch line | Install a CUDA-matched torch build *before* `pip install -r requirements.txt` on the GPU machine |
 | Paths in config | None — all relative to repo root, already correct |
-| Manual work | Boundary annotation file for Step 3 (only if zero-shot eval fails the 80% bar) — this is a human task, not code |
+| Manual work | Boundary annotation file for Step 3 (only if zero-shot eval fails the 80% bar); `huggingface-cli login`/`HF_TOKEN` on the GPU machine if using Path B's `--push` |
+| Path choice | Decide Path A (compare) vs Path B (fine-tune direct) at step 4 — not code, a call to make based on how much confidence you want before committing GPU time |
 
 ## Verification
 
 Each step above has its own confirm/check listed inline (log output, file existence, printed
 metrics). There's no single end-to-end test — verify progressively at each step before moving
-to the next, since later steps (discretization, SLM training) are expensive and depend on the
-outputs of earlier ones being correct.
+to the next, since later steps (discretization, SLM training, Path A's benchmark, Path B's
+fine-tune) are expensive and depend on the outputs of earlier ones being correct.
