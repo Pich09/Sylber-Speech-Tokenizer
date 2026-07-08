@@ -28,6 +28,7 @@ isn't on PyPI. GPU with CUDA is strongly recommended for Steps 3/5/6.
 | — | `src/tokenizer.py encode` | End-to-end: raw wav -> discrete token IDs, via the fitted encoder + k-means |
 | 5/6. SLM | `src/train_slm.py encode / train` | Encode a manifest to token sequences, continue-pretrain OPT-125M on them, report perplexity |
 | — | `src/encoders.py`, `src/compare_encoders.py` | HuBERT/Whisper baseline encoder adapters + a table comparing perplexity/token-rate across encoders (see "Benchmarking" below) |
+| — | `src/publish_checkpoint.py` | Export a fine-tuned Sylber checkpoint locally and/or push it to the Hugging Face Hub for reuse (e.g. in an ASR fine-tune) |
 
 Example end-to-end run:
 
@@ -52,6 +53,39 @@ python src/train_slm.py encode --manifest data/preprocessing/manifests/khmer-spe
     --encoder sylber --out data/tokens/sylber_tokens.jsonl
 python src/train_slm.py train --tokens data/tokens/sylber_tokens.jsonl --encoder sylber
 ```
+
+## Two paths after Step 2/3
+
+Once boundary quality looks reasonable (Step 2, and Step 3 if needed), there
+are two ways to proceed depending on how much confidence you want before
+committing GPU time:
+
+- **Compare first** — run the encoder benchmark below (Sylber vs. HuBERT vs.
+  Whisper) on a small pilot subset of the manifest before deciding whether
+  Sylber is worth fully fine-tuning on Khmer at all.
+- **Fine-tune directly, skip comparison** — go straight to
+  `segmentation.py finetune --mode full_model` on the full corpus, then use
+  `src/publish_checkpoint.py` to export the result locally and/or push it to
+  the Hub for reuse in a separate ASR fine-tune:
+
+  ```bash
+  python src/segmentation.py finetune --manifest <manifest.csv> \
+      --boundaries data/annotations/corrected_boundaries.json --mode full_model \
+      --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
+
+  # local export only:
+  python src/publish_checkpoint.py --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth \
+      --local-dir models/hf_export/syllber-based-audio-encoder
+
+  # export + push to the Hub (needs `huggingface-cli login` or HF_TOKEN first):
+  python src/publish_checkpoint.py --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth \
+      --repo-id Panhapich/syllber-based-audio-encoder --push
+  ```
+
+  `--push` creates the Hub repo as **private** by default (pass `--public`
+  to change that) and uploads the checkpoint plus an auto-generated model
+  card. Note the DDD-Cambodia training data is CC-BY-SA-4.0 — check
+  share-alike license implications before making a derived checkpoint public.
 
 ## Benchmarking against other encoders
 
