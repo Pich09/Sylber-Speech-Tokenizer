@@ -71,8 +71,11 @@ def iter_embeddings(manifest_path: str, encoder_name: str, checkpoint: str | Non
 
 
 def cmd_extract(args):
+    from encoders import resolve_checkpoint
+
     out_dir = Path(args.out or f"data/embeddings/{args.encoder}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    resolved_checkpoint = resolve_checkpoint(args.encoder, args.checkpoint)
 
     shard_paths: list[str] = []
     buffer: list[np.ndarray] = []
@@ -110,6 +113,7 @@ def cmd_extract(args):
         json.dumps(
             {
                 "encoder": args.encoder,
+                "checkpoint": resolved_checkpoint,
                 "shards": shard_paths,
                 "n_syllables": n_syllables,
                 "embedding_dim": embedding_dim,
@@ -224,6 +228,15 @@ def cmd_fit(args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(km, out_path)
     log.info("Saved k-means model (K=%d) to %s", args.k, out_path)
+
+    # Sidecar recording which encoder/checkpoint produced the embeddings this
+    # k-means model was fit on, so encoders.py's SpeechTokenizer can catch a
+    # mismatched checkpoint at encode time instead of silently producing
+    # meaningless token assignments (predict() in the wrong feature space).
+    sidecar_path = Path(str(out_path) + ".meta.json")
+    sidecar_path.write_text(
+        json.dumps({"encoder": meta.get("encoder"), "checkpoint": meta.get("checkpoint"), "k": args.k}, indent=2)
+    )
 
     # Keep tokenizer_config.yaml in sync. Edited via targeted regex substitution
     # (not a full yaml.safe_load/safe_dump round-trip) because PyYAML's dumper

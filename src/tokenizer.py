@@ -25,17 +25,21 @@ log = logging.getLogger(__name__)
 class KhmerSyllableTokenizer:
     """Frozen Sylber encoder + k-means vocabulary -> token IDs.
 
-    Special token IDs (pad/bos/eos) are appended past the k-means vocabulary
-    range, matching `configs/tokenizer_config.yaml: slm.special_tokens`.
+    Special token IDs (pad/bos/eos) are computed from the fitted k-means
+    model's actual `n_clusters` (see special_tokens.py) rather than trusted
+    from config, so they stay correct even if `selected_k` in
+    configs/tokenizer_config.yaml drifts out of sync with the k-means model
+    actually pointed to by `kmeans_path`.
     """
 
-    def __init__(self, segmenter_checkpoint: str, kmeans_path: str, special_tokens: dict[str, int] | None = None):
+    def __init__(self, segmenter_checkpoint: str, kmeans_path: str):
         from segmentation import load_segmenter
+        from special_tokens import special_token_ids
 
         self.segmenter = load_segmenter(segmenter_checkpoint)
         self.kmeans = joblib.load(kmeans_path)
         self.vocab_size = self.kmeans.n_clusters
-        self.special_tokens = special_tokens or {}
+        self.special_tokens = special_token_ids(self.vocab_size)
 
     @classmethod
     def from_config(cls, config_path: str = "configs/tokenizer_config.yaml", use_khmer_finetuned: bool = True):
@@ -50,7 +54,6 @@ class KhmerSyllableTokenizer:
         return cls(
             segmenter_checkpoint=checkpoint,
             kmeans_path=cfg["discretization"]["kmeans_model_path"],
-            special_tokens=cfg["slm"]["special_tokens"],
         )
 
     def encode(self, wav_path: str, add_bos_eos: bool = False) -> dict:

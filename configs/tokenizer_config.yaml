@@ -34,8 +34,10 @@ data:
 
 slm:
   base_model: facebook/opt-125m
-  vocab_size: 10000  # must match discretization.selected_k (+special tokens)
-  special_tokens: {pad: 10000, bos: 10001, eos: 10002}
+  vocab_size: 10000  # default K; override per-encoder via train_slm.py's --vocab-size
+  # pad/bos/eos IDs are NOT set here — they're computed dynamically as
+  # vocab_size, vocab_size+1, vocab_size+2 (see src/special_tokens.py), so
+  # they stay correct even when an encoder's k-means K != this default.
   max_seq_len: 1024
   output_dir: models/khmer_slm_opt125m
 

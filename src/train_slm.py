@@ -45,8 +45,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 def cmd_encode(args):
-    cfg = yaml.safe_load(Path(args.config).read_text())
-
     if args.encoder == "sylber":
         from tokenizer import KhmerSyllableTokenizer
 
@@ -59,8 +57,8 @@ def cmd_encode(args):
             encoder_name=args.encoder,
             kmeans_path=kmeans_path,
             checkpoint=args.checkpoint,
-            special_tokens=cfg["slm"]["special_tokens"],
         )
+    log.info("encoder=%s vocab_size=%d special_tokens=%s", args.encoder, tok.vocab_size, tok.special_tokens)
 
     df = pd.read_csv(args.manifest)
 
@@ -149,15 +147,19 @@ def build_speech_lm(base_model: str, vocab_size: int, max_seq_len: int) -> tuple
 def cmd_train(args):
     from transformers import Trainer, TrainingArguments
 
+    from special_tokens import SPECIAL_TOKEN_NAMES, special_token_ids
+
     cfg = yaml.safe_load(Path(args.config).read_text())
     slm_cfg = cfg["slm"]
     # Different encoders' k-means fits can land on different K (each is
     # swept independently in discretization.py); --vocab-size lets the
     # benchmark match each encoder's actual fitted vocabulary instead of
-    # assuming they all share the config's default K.
+    # assuming they all share the config's default K. Special token IDs are
+    # derived from base_vocab_size (see special_tokens.py) to match exactly
+    # what `encode` baked into the token JSONL for this same vocab size.
     base_vocab_size = args.vocab_size if args.vocab_size is not None else slm_cfg["vocab_size"]
-    vocab_size = base_vocab_size + len(slm_cfg["special_tokens"])
-    pad_id = slm_cfg["special_tokens"]["pad"]
+    vocab_size = base_vocab_size + len(SPECIAL_TOKEN_NAMES)
+    pad_id = special_token_ids(base_vocab_size)["pad"]
     output_dir = args.output_dir or f"{slm_cfg['output_dir']}_{args.encoder}"
 
     model, block_size = build_speech_lm(slm_cfg["base_model"], vocab_size, slm_cfg["max_seq_len"])
