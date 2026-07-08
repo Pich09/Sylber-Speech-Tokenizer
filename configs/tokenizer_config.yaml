@@ -1,0 +1,40 @@
+# Sylber-for-Khmer tokenizer configuration
+# Filled in / updated by src/discretization.py after the k-means sweep (Step 4).
+
+sample_rate: 16000
+
+segmenter:
+  # "sylber" (v1) or "sylber_v2" once released; falls back to whichever the
+  # installed `sylber` package resolves for this ckpt name.
+  base_checkpoint: sylber
+  khmer_finetuned_checkpoint: models/sylber_checkpoints/sylber_khmer_v1.pth
+  khmer_english_finetuned_checkpoint: models/sylber_checkpoints/sylber_khmer_english_v1.pth
+  in_second: true
+
+discretization:
+  # Sweep from the scaling paper; final `selected_k` is written by
+  # discretization.py once cluster-balance metrics are reviewed.
+  k_sweep: [5000, 10000, 20000, 40000]
+  selected_k: 10000
+  kmeans_model_path: models/khmer_kmeans_10k.pkl
+  random_state: 42
+  minibatch: true
+  batch_size: 10000
+
+expected_token_rate_hz:
+  min: 4.0
+  max: 5.0
+
+data:
+  primary_corpus: data/khmer_asr_cultural_v2
+  secondary_corpus: data/khm_asr_cultural
+  eval_corpus: data/openslr_42
+  splits: {train: 0.8, val: 0.1, test: 0.1}
+  manifest_dir: data/preprocessing/manifests
+
+slm:
+  base_model: facebook/opt-125m
+  vocab_size: 10000  # must match discretization.selected_k (+special tokens)
+  special_tokens: {pad: 10000, bos: 10001, eos: 10002}
+  max_seq_len: 1024
+  output_dir: models/khmer_slm_opt125m

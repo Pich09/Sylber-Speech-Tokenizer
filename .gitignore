@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data / model artifacts (large, not checked into git)
+data/khmer_asr_cultural_v2/wav16k/
+data/khm_asr_cultural/
+data/openslr_42/*
+!data/openslr_42/.gitkeep
+data/embeddings/
+data/tokens/
+models/sylber_checkpoints/*
+!models/sylber_checkpoints/.gitkeep
+models/*.pkl
+models/*.pth
+models/khmer_slm_opt125m/
+
+# Results (regenerable)
+results/tokenization_examples/*
+!results/tokenization_examples/.gitkeep
+results/downstream_eval/*
+!results/downstream_eval/.gitkeep
+
+# IDE / OS
+.vscode/
+.DS_Store
+.claude/settings.local.json
