@@ -147,7 +147,10 @@ def build_speech_lm(base_model: str, vocab_size: int, max_seq_len: int) -> tuple
 def cmd_train(args):
     from transformers import Trainer, TrainingArguments
 
+    from log_utils import add_file_handler
     from special_tokens import SPECIAL_TOKEN_NAMES, special_token_ids
+
+    add_file_handler(f"logs/slm_{args.encoder}.log")
 
     cfg = yaml.safe_load(Path(args.config).read_text())
     slm_cfg = cfg["slm"]

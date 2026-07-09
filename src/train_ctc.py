@@ -199,6 +199,9 @@ def run_epoch(
 
 def cmd_train(args):
     from encoders import load_encoder
+    from log_utils import add_file_handler
+
+    add_file_handler(f"logs/ctc_probe_{args.encoder}.log")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 

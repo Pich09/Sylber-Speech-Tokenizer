@@ -288,6 +288,9 @@ def finetune_segmenter(
 
 
 def cmd_finetune(args):
+    from log_utils import add_file_handler
+
+    add_file_handler(f"logs/segmentation_finetune_{Path(args.out_ckpt).stem}.log")
     finetune_segmenter(
         manifest_path=args.manifest,
         boundaries_json=args.boundaries,

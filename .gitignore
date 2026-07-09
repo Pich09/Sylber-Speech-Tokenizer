@@ -22,8 +22,12 @@ results/tokenization_examples/*
 !results/tokenization_examples/.gitkeep
 results/downstream_eval/*
 !results/downstream_eval/.gitkeep
+logs/*
+!logs/.gitkeep
 
 # IDE / OS
 .vscode/
 .DS_Store
 .claude/settings.local.json
+docs/Sylber*
+docs/path*

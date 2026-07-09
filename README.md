@@ -154,6 +154,14 @@ input_length >= target_length, which Sylber's low token rate hits more
 often than HuBERT/Whisper on short utterances; a rising `n_skipped` is a
 signal to filter very short utterances out of the manifest before training.
 
+## Logs
+
+Each model-training command (`segmentation.py finetune`, `train_slm.py
+train`, `train_ctc.py train`) writes a persistent log file under `logs/` in
+addition to console output — `logs/segmentation_finetune_<ckpt-name>.log`,
+`logs/slm_<encoder>.log`, `logs/ctc_probe_<encoder>.log` respectively — so
+each encoder/run's training history is kept separately for later review.
+
 ## Config
 
 All paths/hyperparameters (k-means K, vocab size, SLM base model, splits) live in
