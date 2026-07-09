@@ -19,6 +19,32 @@ the ambiguity differently and cost very different amounts of GPU time.
 They are not mutually exclusive, but **Option A is the recommended
 starting point** — see the recommendation at the end before picking.
 
+## Where this fits into `docs/run-roadmap.md`
+
+This doc doesn't replace the original roadmap's numbered steps — it's a
+follow-up to how step 4's Path A branch actually turned out, so here's how
+the two options map onto that existing sequence:
+
+- **Steps 1-2** (data prep, zero-shot eval) — already done for the 20h
+  subset; both options below reuse that same manifest/audio as-is (Option
+  B only needs *more* of it, not different prep — see the "Also have a
+  folder to save logs" / preprocessing discussion: prep is identical
+  across encoders and options, only the encoder-specific extraction step
+  downstream of it forks).
+- **Step 3** (conditional fine-tune) — was skipped for the 20h run since
+  zero-shot passed the 4-5Hz sanity check. Both options' backup ladders
+  (see below) can loop back to this step if a frozen/zero-shot Sylber
+  turns out to be the actual bottleneck rather than the encoder itself.
+- **Step 4** (Path A vs. Path B decision point) — Path A was the branch
+  taken; `docs/path-a-encoder-comparison.md` is that run's result, and this
+  doc is specifically about what to do with Path A's ambiguous outcome
+  before deciding whether to proceed to Path B. It is not a new instance of
+  the same decision — it's "Path A came back unclear, now what."
+- **Step 5** (SLM training) — **Option B below is a re-run of this exact
+  step**, just at larger scale and with a Sylber-specific K. **Option A
+  bypasses step 5 entirely**, going from steps 1-3's encoder straight to a
+  supervised CTC decoder instead of an unsupervised SLM.
+
 ## Option A — CTC probe (test the real ASR goal directly, cheap, no new data needed)
 
 Your actual end goal (per earlier discussion) is fine-tuning Sylber for

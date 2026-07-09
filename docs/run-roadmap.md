@@ -128,6 +128,13 @@ All commands below assume `cwd` = repo root, venv activated.
    are tracked by their own `--out` filenames, not the shared config); `compare_encoders.py`
    writes `results/downstream_eval/encoder_comparison.{csv,md}`.
 
+   **If Path A's perplexity comparison comes back ambiguous** (e.g. Sylber
+   looking dramatically worse on a small pilot subset), don't treat that as
+   final — see `docs/post-benchmark-roadmap.md` for why a small-subset
+   discrete-SLM comparison needs far more data than a CTC-based check to be
+   trustworthy, and for the two follow-up options (CTC probe vs. scaling
+   this step up) before deciding whether to move to Path B.
+
    **Path B (direct fine-tune) — full-model fine-tune + publish:**
    ```bash
    python src/segmentation.py finetune --manifest <manifest.csv> \
