@@ -28,6 +28,7 @@ isn't on PyPI. GPU with CUDA is strongly recommended for Steps 3/5/6.
 | — | `src/tokenizer.py encode` | End-to-end: raw wav -> discrete token IDs, via the fitted encoder + k-means |
 | 5/6. SLM | `src/train_slm.py encode / train` | Encode a manifest to token sequences, continue-pretrain OPT-125M on them, report perplexity |
 | — | `src/encoders.py`, `src/compare_encoders.py` | HuBERT/Whisper baseline encoder adapters + a table comparing perplexity/token-rate across encoders (see "Benchmarking" below) |
+| — | `src/train_ctc.py` | CTC probe: frozen encoder + small supervised decoder trained on the manifest's `transcript` column, reports CER — a cheap, direct ASR-relevant signal that doesn't need the ~1K+ hours the discrete-SLM comparison needs (see "CTC probe" below) |
 | — | `src/publish_checkpoint.py` | Export a fine-tuned Sylber checkpoint locally and/or push it to the Hugging Face Hub for reuse (e.g. in an ASR fine-tune) |
 
 Example end-to-end run:
@@ -117,6 +118,41 @@ notion of syllable boundaries — their embeddings are raw frame-level
 features (~50 Hz) fed through the same k-means step, so the comparison is
 "syllable tokens vs. discretized frame tokens," matching how the doc's Step 5
 baseline (HuBERT at 25-50 Hz) is meant to be read against Sylber's 4-5 Hz.
+
+## CTC probe
+
+`docs/path-a-encoder-comparison.md` ran the discrete-SLM comparison (above)
+on a 20h subset and found Sylber's perplexity far worse than HuBERT/Whisper
+— but that comparison method itself needs much more data to be trustworthy:
+Sylber's own paper trains its discrete-token uLM on a 1K-hour "limited
+resource" floor (66K hours at full scale), 50x+ more than a 20h pilot. At
+20h, *any* encoder's discrete-token LM is starved, and Sylber (4.76 Hz, ~10x
+fewer tokens per hour than HuBERT/Whisper's ~50 Hz) hits that floor first —
+so the 20h perplexity gap is more a data-scale artifact than a signal that
+Sylber is a worse fit for Khmer.
+
+`src/train_ctc.py` is a more appropriate low-resource test at this data
+scale: a frozen (or lightly fine-tuned) encoder feeding a small supervised
+CTC decoder trained directly on transcripts, evaluated by character error
+rate. This mirrors Sylber 2.0's own "Low-Resource ASR" experiment (Korean/
+Bemba/Quecha, 20-50h each), where Sylber-family encoders are competitive
+with or better than other tokenizers — i.e. the regime the papers actually
+validate at your data scale, versus the 1K+ hour regime the discrete-SLM
+comparison needs.
+
+```bash
+python src/train_ctc.py train --manifest <manifest.csv> --encoder sylber
+python src/train_ctc.py train --manifest <manifest.csv> --encoder hubert --checkpoint facebook/hubert-base-ls960
+python src/train_ctc.py train --manifest <manifest.csv> --encoder whisper --checkpoint openai/whisper-base
+```
+
+Writes `models/ctc_probe_<encoder>.pth` (decoder head + character vocab)
+and `results/downstream_eval/ctc_probe_<encoder>.json` (per-epoch loss/CER).
+Utterances where the encoder's output sequence is shorter than the
+transcript are skipped and counted (`n_skipped`) — CTC requires
+input_length >= target_length, which Sylber's low token rate hits more
+often than HuBERT/Whisper on short utterances; a rising `n_skipped` is a
+signal to filter very short utterances out of the manifest before training.
 
 ## Config
 
