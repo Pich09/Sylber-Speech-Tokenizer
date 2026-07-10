@@ -149,6 +149,7 @@ def run_epoch(
     n_skipped = 0
     n_used = 0
     skip_reasons = {"empty_transcript": 0, "no_labelable_units": 0, "input_shorter_than_target": 0}
+    length_skip_examples = []  # up to 5 (feats_shape, label_length) pairs for diagnosing *why* T < L
 
     rows = df.to_dict("records")
     batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
@@ -177,6 +178,8 @@ def run_epoch(
                 # (HuBERT/Whisper) on short utterances.
                 n_skipped += 1
                 skip_reasons["input_shorter_than_target"] += 1
+                if len(length_skip_examples) < 5:
+                    length_skip_examples.append((tuple(feats.shape) if feats is not None else None, len(label_ids)))
                 continue
 
             # Eval passes never call .backward(), so skip building the
@@ -210,6 +213,7 @@ def run_epoch(
         "n_used": n_used,
         "n_skipped": n_skipped,
         "skip_reasons": skip_reasons,
+        "length_skip_examples": length_skip_examples,
     }
     if not training:
         result["cer"] = total_edits / max(total_ref_chars, 1)
@@ -272,7 +276,9 @@ def cmd_train(args):
         eval_stats = run_epoch(
             encoder, head, val_df, char2id, blank_id, device, ctc_loss_fn,
             optimizer=None, batch_size=args.batch_size, desc=f"val epoch {epoch + 1}/{args.epochs}",
-        ) if not val_df.empty else {"mean_loss": None, "cer": None, "n_used": 0, "n_skipped": 0, "skip_reasons": {}}
+        ) if not val_df.empty else {
+            "mean_loss": None, "cer": None, "n_used": 0, "n_skipped": 0, "skip_reasons": {}, "length_skip_examples": [],
+        }
 
         log.info(
             "epoch %d/%d train_loss=%.4f (used=%d skipped=%d) val_loss=%s val_cer=%s (used=%d skipped=%d)",
@@ -284,8 +290,14 @@ def cmd_train(args):
                 "Every training utterance was skipped — skip_reasons=%s. If "
                 "'input_shorter_than_target' dominates, this encoder's token rate is too low "
                 "for these transcripts' label length; if 'no_labelable_units' or "
-                "'empty_transcript' dominates, check the manifest's transcript column.",
-                train_stats["skip_reasons"],
+                "'empty_transcript' dominates, check the manifest's transcript column. "
+                "Example (encoder_output_shape, label_length) pairs: %s — if the shape's first "
+                "dimension looks fixed/tiny (e.g. always 1) regardless of label_length, the "
+                "encoder adapter is likely returning a batch dimension instead of the true "
+                "sequence length; if it varies but is still consistently smaller than "
+                "label_length, the encoder's segmentation is under-producing tokens relative to "
+                "actual syllable count for this language.",
+                train_stats["skip_reasons"], train_stats["length_skip_examples"],
             )
         history.append({"epoch": epoch + 1, "train": train_stats, "val": eval_stats})
 
