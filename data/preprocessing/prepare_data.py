@@ -108,12 +108,21 @@ def process_hf_dataset(
             {
                 "path": str(out_path),
                 "duration_sec": len(y) / TARGET_SR,
-                "transcript": example.get("transcription") or example.get("text") or "",
+                "transcript": example.get("transcript") or example.get("transcription") or example.get("text") or "",
                 "speaker": example.get("speaker_id", example.get("speaker", "unknown")),
             }
         )
 
     df = pd.DataFrame(rows)
+    empty_frac = (df["transcript"] == "").mean() if len(df) else 0.0
+    if empty_frac > 0.5:
+        log.warning(
+            "%.0f%% of rows have an empty transcript — this dataset's transcript field likely "
+            "doesn't match any of 'transcript'/'transcription'/'text'; check its actual column "
+            "names (e.g. via the HF dataset viewer) and adjust the .get(...) fallback chain above. "
+            "Downstream steps (train_ctc.py) will silently skip every utterance otherwise.",
+            empty_frac * 100,
+        )
     df = assign_splits(df, splits)
     return df
 
