@@ -99,7 +99,13 @@ All commands below assume `cwd` = repo root, venv activated.
    Both are documented with full command sequences in the README's
    ["Two paths after Step 2/3"](../README.md#two-paths-after-step-23) and
    ["Benchmarking against other encoders"](../README.md#benchmarking-against-other-encoders)
-   sections — this roadmap just calls out the GPU-machine-specific notes for each:
+   sections — this roadmap just calls out the GPU-machine-specific notes for each. **If you've
+   already run Path A on a small subset and its comparison looks ambiguous** (e.g. Sylber's
+   perplexity far worse than the other encoders), don't decide Path A vs. Path B from that number
+   alone — jump to [`docs/post-benchmark-roadmap.md`](post-benchmark-roadmap.md) first, which
+   covers why a small-subset discrete-SLM comparison needs much more data to be trustworthy and
+   lays out two follow-up options (a CTC probe vs. scaling this comparison up) before committing
+   to either path.
 
    **Path A (benchmark) — discretization + SLM training per encoder:**
    ```bash
@@ -172,6 +178,7 @@ All commands below assume `cwd` = repo root, venv activated.
 | Paths in config | None — all relative to repo root, already correct |
 | Manual work | Boundary annotation file for Step 3 (only if zero-shot eval fails the 80% bar); `huggingface-cli login`/`HF_TOKEN` on the GPU machine if using Path B's `--push` |
 | Path choice | Decide Path A (compare) vs Path B (fine-tune direct) at step 4 — not code, a call to make based on how much confidence you want before committing GPU time |
+| Ambiguous Path A result | See `docs/post-benchmark-roadmap.md` — CTC probe vs. scaled-up SLM comparison, before committing to Path A's verdict or moving to Path B |
 
 ## Verification
 
