@@ -127,7 +127,6 @@ def run_epoch(
     head.train(training)
 
     total_loss = 0.0
-    n_loss_batches = 0
     total_edits = 0
     total_ref_chars = 0
     n_skipped = 0
@@ -139,7 +138,6 @@ def run_epoch(
     for batch in tqdm(batches, desc=desc):
         if training:
             optimizer.zero_grad()
-        batch_loss = 0.0
         n_in_batch = 0
 
         for row in batch:
@@ -160,16 +158,19 @@ def run_epoch(
                 n_skipped += 1
                 continue
 
-            logits = head(feats)  # (T, V+1)
-            log_probs = F.log_softmax(logits, dim=-1).unsqueeze(1)  # (T, 1, V+1)
-            input_length = torch.tensor([feats.shape[0]])
-            target_length = torch.tensor([len(label_ids)])
-            targets = torch.tensor(label_ids, dtype=torch.long)
-
-            loss = ctc_loss_fn(log_probs, targets, input_length, target_length)
+            # Eval passes never call .backward(), so skip building the
+            # autograd graph through the head for them (same wasted-VRAM
+            # pattern already fixed in segmentation.py's head_only mode).
+            with torch.enable_grad() if training else torch.no_grad():
+                logits = head(feats)  # (T, V+1)
+                log_probs = F.log_softmax(logits, dim=-1).unsqueeze(1)  # (T, 1, V+1)
+                input_length = torch.tensor([feats.shape[0]])
+                target_length = torch.tensor([len(label_ids)])
+                targets = torch.tensor(label_ids, dtype=torch.long)
+                loss = ctc_loss_fn(log_probs, targets, input_length, target_length)
             if training:
                 loss.backward()
-            batch_loss += loss.item()
+            total_loss += loss.item()
             n_in_batch += 1
             n_used += 1
 
@@ -183,12 +184,8 @@ def run_epoch(
             if scheduler is not None:
                 scheduler.step()
 
-        if n_in_batch > 0:
-            total_loss += batch_loss
-            n_loss_batches += 1
-
     result = {
-        "mean_loss": total_loss / max(n_loss_batches, 1),
+        "mean_loss": total_loss / max(n_used, 1),
         "n_used": n_used,
         "n_skipped": n_skipped,
     }
@@ -233,7 +230,7 @@ def cmd_train(args):
     ctc_loss_fn = nn.CTCLoss(blank=blank_id, zero_infinity=True)
     optimizer = torch.optim.Adam(head.parameters(), lr=args.lr)
 
-    n_train_batches = max(len(train_df) // args.batch_size, 1)
+    n_train_batches = max(-(-len(train_df) // args.batch_size), 1)  # ceil division: batches() below always rounds up
     total_steps = n_train_batches * args.epochs
     scheduler = None
     if args.warmup_ratio > 0:

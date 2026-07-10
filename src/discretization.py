@@ -147,11 +147,22 @@ def _fit_kmeans_streaming(shard_paths: list[str], k: int, random_state: int = 42
     be resident in RAM at once — only one shard, sub-chunked to `batch_size`."""
     from sklearn.cluster import MiniBatchKMeans
 
+    # MiniBatchKMeans requires each partial_fit call to see >= n_clusters
+    # samples; the default batch_size=10000 breaks any K above that (e.g.
+    # the k_sweep default's 20000/40000 points) with "n_samples < n_clusters".
+    batch_size = max(batch_size, k)
     km = MiniBatchKMeans(n_clusters=k, random_state=random_state, batch_size=batch_size, n_init=3)
     for p in range(n_passes):
         for shard in iter_shards(shard_paths):
             for i in range(0, len(shard), batch_size):
-                km.partial_fit(shard[i : i + batch_size])
+                chunk = shard[i : i + batch_size]
+                if len(chunk) < k:
+                    # Trailing sub-chunk smaller than n_clusters (only when
+                    # a custom --k-sweep value doesn't evenly divide
+                    # SHARD_SIZE); partial_fit requires >= n_clusters
+                    # samples, so skip rather than crash on the remainder.
+                    continue
+                km.partial_fit(chunk)
         log.info("K=%d: completed pass %d/%d over shards", k, p + 1, n_passes)
     return km
 
