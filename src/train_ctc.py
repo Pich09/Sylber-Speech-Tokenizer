@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import regex
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,11 +39,26 @@ log = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent))
 
 
+def tokenize_transcript(text: str) -> list[str]:
+    """Split into Unicode extended grapheme clusters (UAX #29) rather than
+    raw codepoints. Khmer syllables are typically encoded as a base
+    consonant plus one or more combining codepoints (e.g. the coeng
+    U+17D2 subscript-forming sequence, vowel signs, diacritics) — splitting
+    on raw codepoints overcounts label length by roughly 2-4x relative to
+    the number of spoken syllables, which made every utterance fail CTC's
+    input_length >= target_length requirement against Sylber's ~1-token-
+    per-syllable rate (HuBERT/Whisper's ~50Hz rate has enough headroom
+    that this didn't surface there). Grapheme clusters keep label units
+    close to one per syllable instead."""
+    return regex.findall(r"\X", text)
+
+
 def build_char_vocab(transcripts: list[str]) -> dict[str, int]:
-    """Character-level vocabulary from training transcripts. CTC's blank
-    class is appended as the final ID (len(vocab)), not included here."""
-    chars = sorted({c for t in transcripts for c in t})
-    return {c: i for i, c in enumerate(chars)}
+    """Grapheme-cluster vocabulary from training transcripts (see
+    `tokenize_transcript`). CTC's blank class is appended as the final ID
+    (len(vocab)), not included here."""
+    units = sorted({u for t in transcripts for u in tokenize_transcript(t)})
+    return {u: i for i, u in enumerate(units)}
 
 
 def edit_distance(pred: list, ref: list) -> int:
@@ -122,7 +138,8 @@ def run_epoch(
     """One pass over `df`. If `optimizer` is None, runs in eval mode (no
     backward, computes CER instead of training). Skips utterances where the
     encoder's output is shorter than the transcript (CTC requires
-    input_length >= target_length) or the transcript is empty."""
+    input_length >= target_length) or the transcript is empty — see
+    `skip_reasons` in the returned dict for a breakdown of which."""
     training = optimizer is not None
     head.train(training)
 
@@ -131,6 +148,7 @@ def run_epoch(
     total_ref_chars = 0
     n_skipped = 0
     n_used = 0
+    skip_reasons = {"empty_transcript": 0, "no_labelable_units": 0, "input_shorter_than_target": 0}
 
     rows = df.to_dict("records")
     batches = [rows[i : i + batch_size] for i in range(0, len(rows), batch_size)]
@@ -144,18 +162,21 @@ def run_epoch(
             transcript = row.get("transcript", "")
             if not isinstance(transcript, str) or not transcript:
                 n_skipped += 1
+                skip_reasons["empty_transcript"] += 1
                 continue
-            label_ids = [char2id[c] for c in transcript if c in char2id]
+            label_ids = [char2id[c] for c in tokenize_transcript(transcript) if c in char2id]
             if not label_ids:
                 n_skipped += 1
+                skip_reasons["no_labelable_units"] += 1
                 continue
 
             feats = extract_features(encoder, row["path"], device)
             if feats is None or feats.shape[0] < len(label_ids):
                 # CTC requires input_length >= target_length; syllable-rate
-                # encoders (Sylber) hit this far more often than frame-rate
-                # ones (HuBERT/Whisper) on short utterances.
+                # encoders (Sylber) hit this more often than frame-rate ones
+                # (HuBERT/Whisper) on short utterances.
                 n_skipped += 1
+                skip_reasons["input_shorter_than_target"] += 1
                 continue
 
             # Eval passes never call .backward(), so skip building the
@@ -188,6 +209,7 @@ def run_epoch(
         "mean_loss": total_loss / max(n_used, 1),
         "n_used": n_used,
         "n_skipped": n_skipped,
+        "skip_reasons": skip_reasons,
     }
     if not training:
         result["cer"] = total_edits / max(total_ref_chars, 1)
@@ -215,7 +237,7 @@ def cmd_train(args):
 
     char2id = build_char_vocab(train_df["transcript"].tolist())
     blank_id = len(char2id)
-    log.info("Character vocab size=%d (+1 CTC blank) built from %d train transcripts", len(char2id), len(train_df))
+    log.info("Grapheme-cluster vocab size=%d (+1 CTC blank) built from %d train transcripts", len(char2id), len(train_df))
 
     encoder = load_encoder(args.encoder, checkpoint=args.checkpoint, device=device)
 
@@ -250,13 +272,21 @@ def cmd_train(args):
         eval_stats = run_epoch(
             encoder, head, val_df, char2id, blank_id, device, ctc_loss_fn,
             optimizer=None, batch_size=args.batch_size, desc=f"val epoch {epoch + 1}/{args.epochs}",
-        ) if not val_df.empty else {"mean_loss": None, "cer": None, "n_used": 0, "n_skipped": 0}
+        ) if not val_df.empty else {"mean_loss": None, "cer": None, "n_used": 0, "n_skipped": 0, "skip_reasons": {}}
 
         log.info(
             "epoch %d/%d train_loss=%.4f (used=%d skipped=%d) val_loss=%s val_cer=%s (used=%d skipped=%d)",
             epoch + 1, args.epochs, train_stats["mean_loss"], train_stats["n_used"], train_stats["n_skipped"],
             eval_stats["mean_loss"], eval_stats.get("cer"), eval_stats["n_used"], eval_stats["n_skipped"],
         )
+        if epoch == 0 and train_stats["n_used"] == 0:
+            log.warning(
+                "Every training utterance was skipped — skip_reasons=%s. If "
+                "'input_shorter_than_target' dominates, this encoder's token rate is too low "
+                "for these transcripts' label length; if 'no_labelable_units' or "
+                "'empty_transcript' dominates, check the manifest's transcript column.",
+                train_stats["skip_reasons"],
+            )
         history.append({"epoch": epoch + 1, "train": train_stats, "val": eval_stats})
 
     out_ckpt = Path(args.out_ckpt or f"models/ctc_probe_{args.encoder}.pth")

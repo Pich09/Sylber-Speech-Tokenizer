@@ -133,12 +133,12 @@ Sylber is a worse fit for Khmer.
 
 `src/train_ctc.py` is a more appropriate low-resource test at this data
 scale: a frozen (or lightly fine-tuned) encoder feeding a small supervised
-CTC decoder trained directly on transcripts, evaluated by character error
-rate. This mirrors Sylber 2.0's own "Low-Resource ASR" experiment (Korean/
-Bemba/Quecha, 20-50h each), where Sylber-family encoders are competitive
-with or better than other tokenizers — i.e. the regime the papers actually
-validate at your data scale, versus the 1K+ hour regime the discrete-SLM
-comparison needs.
+CTC decoder trained directly on transcripts, evaluated by an error rate
+close to (but not exactly) character error rate. This mirrors Sylber 2.0's
+own "Low-Resource ASR" experiment (Korean/Bemba/Quecha, 20-50h each),
+where Sylber-family encoders are competitive with or better than other
+tokenizers — i.e. the regime the papers actually validate at your data
+scale, versus the 1K+ hour regime the discrete-SLM comparison needs.
 
 ```bash
 python src/train_ctc.py train --manifest <manifest.csv> --encoder sylber
@@ -146,13 +146,24 @@ python src/train_ctc.py train --manifest <manifest.csv> --encoder hubert --check
 python src/train_ctc.py train --manifest <manifest.csv> --encoder whisper --checkpoint openai/whisper-base
 ```
 
-Writes `models/ctc_probe_<encoder>.pth` (decoder head + character vocab)
-and `results/downstream_eval/ctc_probe_<encoder>.json` (per-epoch loss/CER).
-Utterances where the encoder's output sequence is shorter than the
-transcript are skipped and counted (`n_skipped`) — CTC requires
-input_length >= target_length, which Sylber's low token rate hits more
-often than HuBERT/Whisper on short utterances; a rising `n_skipped` is a
-signal to filter very short utterances out of the manifest before training.
+CTC labels are Unicode extended grapheme clusters (`regex`'s `\X`), not raw
+codepoints — Khmer syllables are typically encoded as a base consonant plus
+combining marks (coeng subscripts, vowel signs, diacritics), so splitting
+on raw codepoints would overcount label length by ~2-4x relative to actual
+syllables. That matters because CTC requires `input_length >=
+target_length`: at raw-codepoint granularity, Sylber's ~4.76Hz token rate
+(≈1 token/syllable) fails that check for essentially every utterance,
+which is why this uses grapheme clusters instead — they track spoken
+syllables closely enough that Sylber's token count usually clears the bar
+(HuBERT/Whisper's ~50Hz rate has enough headroom that this doesn't matter
+for them either way).
+
+Writes `models/ctc_probe_<encoder>.pth` (decoder head + grapheme-cluster
+vocab) and `results/downstream_eval/ctc_probe_<encoder>.json` (per-epoch
+loss/CER, plus a `skip_reasons` breakdown for skipped utterances —
+`input_shorter_than_target` still happens occasionally on very short
+utterances even with grapheme clustering; a manifest with many of those is
+a signal to filter short utterances out before training).
 
 ## Logs
 
