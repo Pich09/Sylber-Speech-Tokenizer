@@ -144,7 +144,16 @@ def iter_shards(shard_paths: list[str]):
 def _fit_kmeans_streaming(shard_paths: list[str], k: int, random_state: int = 42, batch_size: int = 10000, n_passes: int = 3):
     """Fit MiniBatchKMeans via `partial_fit` over on-disk shards, so the full
     embedding set (potentially tens of GB at full-corpus scale) never has to
-    be resident in RAM at once — only one shard, sub-chunked to `batch_size`."""
+    be resident in RAM at once — accumulate a buffer across shards until it
+    reaches `batch_size`, then flush.
+
+    Buffering *across* shards (not just within one, as an earlier version
+    did) matters because chunking each shard independently silently skipped
+    every chunk — and left the model completely unfitted — whenever an
+    individual shard held fewer than K samples (any corpus small enough
+    that SHARD_SIZE doesn't fill a full shard, e.g. a pilot/smoke-test
+    run), even though the shards *combined* had plenty of samples for K.
+    """
     from sklearn.cluster import MiniBatchKMeans
 
     # MiniBatchKMeans requires each partial_fit call to see >= n_clusters
@@ -152,18 +161,36 @@ def _fit_kmeans_streaming(shard_paths: list[str], k: int, random_state: int = 42
     # the k_sweep default's 20000/40000 points) with "n_samples < n_clusters".
     batch_size = max(batch_size, k)
     km = MiniBatchKMeans(n_clusters=k, random_state=random_state, batch_size=batch_size, n_init=3)
+    fitted = False
     for p in range(n_passes):
+        buffer: list[np.ndarray] = []
+        buffer_n = 0
         for shard in iter_shards(shard_paths):
-            for i in range(0, len(shard), batch_size):
-                chunk = shard[i : i + batch_size]
-                if len(chunk) < k:
-                    # Trailing sub-chunk smaller than n_clusters (only when
-                    # a custom --k-sweep value doesn't evenly divide
-                    # SHARD_SIZE); partial_fit requires >= n_clusters
-                    # samples, so skip rather than crash on the remainder.
-                    continue
+            buffer.append(shard)
+            buffer_n += len(shard)
+            while buffer_n >= batch_size:
+                merged = np.concatenate(buffer, axis=0) if len(buffer) > 1 else buffer[0]
+                chunk, rest = merged[:batch_size], merged[batch_size:]
                 km.partial_fit(chunk)
+                fitted = True
+                buffer = [rest] if len(rest) else []
+                buffer_n = len(rest)
+        if buffer_n >= k:
+            merged = np.concatenate(buffer, axis=0) if len(buffer) > 1 else buffer[0]
+            km.partial_fit(merged)
+            fitted = True
+        elif buffer_n > 0:
+            log.warning(
+                "K=%d pass %d/%d: dropping final %d leftover samples (< n_clusters=%d)",
+                k, p + 1, n_passes, buffer_n, k,
+            )
         log.info("K=%d: completed pass %d/%d over shards", k, p + 1, n_passes)
+    if not fitted:
+        total = sum(len(s) for s in iter_shards(shard_paths))
+        raise ValueError(
+            f"K={k} exceeds total available samples ({total}) across all shards in {shard_paths!r}; "
+            "MiniBatchKMeans was never fit. Lower --k / --k-sweep or extract more data."
+        )
     return km
 
 
