@@ -70,18 +70,32 @@ def resample_and_trim(audio: np.ndarray, orig_sr: int, do_vad: bool = True) -> n
     return audio
 
 
-def process_hf_dataset(dataset_name: str, out_dir: Path, splits: dict, do_vad: bool = True) -> pd.DataFrame:
+def process_hf_dataset(
+    dataset_name: str, out_dir: Path, splits: dict, do_vad: bool = True, max_samples: int | None = None
+) -> pd.DataFrame:
     from datasets import load_dataset
 
     out_dir.mkdir(parents=True, exist_ok=True)
     audio_dir = out_dir / "wav16k"
     audio_dir.mkdir(exist_ok=True)
 
-    log.info("Loading %s from Hugging Face (this streams/downloads the corpus)...", dataset_name)
-    ds = load_dataset(dataset_name, split="train")
+    # `max_samples` uses HF streaming mode so only the first N examples are
+    # ever fetched, instead of `load_dataset`'s default behavior of
+    # downloading the entire corpus (~495GB, 1065h) before anything can be
+    # subset — needed for a cheap pilot run on a disk/time-limited machine
+    # like Colab.
+    if max_samples is not None:
+        import itertools
+
+        log.info("Streaming %s from Hugging Face, capped at %d examples...", dataset_name, max_samples)
+        ds = load_dataset(dataset_name, split="train", streaming=True)
+        ds = itertools.islice(ds, max_samples)
+    else:
+        log.info("Loading %s from Hugging Face (this downloads the full corpus)...", dataset_name)
+        ds = load_dataset(dataset_name, split="train")
 
     rows = []
-    for i, example in enumerate(tqdm(ds, desc=f"processing {dataset_name}")):
+    for i, example in enumerate(tqdm(ds, desc=f"processing {dataset_name}", total=max_samples)):
         audio = example["audio"]
         y = np.asarray(audio["array"], dtype=np.float32)
         sr = audio["sampling_rate"]
@@ -127,6 +141,10 @@ def main():
     parser.add_argument("--out", type=str, default="data/khmer_asr_cultural_v2")
     parser.add_argument("--no-vad", action="store_true", help="skip silence trimming")
     parser.add_argument("--manifest-name", type=str, default=None)
+    parser.add_argument(
+        "--max-samples", type=int, default=None,
+        help="stream only the first N examples instead of downloading the full corpus (cheap pilot run, e.g. on Colab)",
+    )
     args = parser.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -134,7 +152,7 @@ def main():
     manifest_dir = Path(cfg["data"]["manifest_dir"])
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    df = process_hf_dataset(args.dataset, Path(args.out), splits, do_vad=not args.no_vad)
+    df = process_hf_dataset(args.dataset, Path(args.out), splits, do_vad=not args.no_vad, max_samples=args.max_samples)
 
     manifest_name = args.manifest_name or (args.dataset.split("/")[-1] + "_manifest.csv")
     manifest_path = manifest_dir / manifest_name
