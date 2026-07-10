@@ -114,6 +114,39 @@ Decision tree:
 used for Path A — no new data, no new downloads. This is a few hours of
 GPU time per encoder, not days.
 
+### Pilot result (Colab smoke test, ~40min/300-utterance subset)
+
+Ran `notebooks/colab_pilot_run.ipynb`'s deliberately tiny smoke test
+(240 train / 30 val utterances, 8 epochs) before committing to a real 20h+
+run, and got a concrete, interpretable result — not just "inconclusive at
+this scale" like the SLM path was:
+
+- **HuBERT**: `final_val_cer=0.985` — expected-bad at this scale (240
+  utterances / 8 epochs is nowhere near enough to train a ~90-class CTC
+  head from scratch), not a real signal either way. A firmer HuBERT number
+  needs the full 20h+ run, same as any encoder would.
+- **Sylber**: every val utterance skipped (`input_shorter_than_target`),
+  so `final_val_cer=0.0` is a false zero (no comparisons were made), not
+  "perfect." Diagnostic (encoder_output_shape, label_length) examples from
+  epoch 1: `(43,768)/70`, `(42,768)/64`, `(26,768)/35`, `(18,768)/29`,
+  `(32,768)/47` — the output shape varies correctly per utterance (rules
+  out a batch-dimension bug in the encoder adapter), but Sylber's token
+  count `T` is consistently **~60-70% of** the grapheme-cluster label
+  length `L` (ratio ≈0.66 averaged across the 5 examples). That's a real,
+  systematic shortfall, not noise — zero-shot Sylber (English-only
+  pretraining) is detecting roughly a third fewer syllable boundaries than
+  Khmer transcripts imply.
+
+**This is not a code bug to keep chasing** — `T < L` here reflects actual
+segmentation quality, and no amount of CTC-probe-side fixing (grapheme
+clustering already applied) can manufacture tokens Sylber didn't produce.
+It's concrete evidence for backup-ladder step 1 above: **fine-tune the
+boundary head on Khmer (Step 3) before the CTC probe can produce a usable
+Sylber number at all**, not just before trusting it. Until that fine-tune
+happens, treat Sylber's CTC probe as blocked, and if you want any
+usable pilot signal in the meantime, it's HuBERT's (with the caveat that
+240/8-epochs is still too small to mean much either).
+
 ## Option B — Scale audio to match token count (fix the SLM comparison itself)
 
 If you still want the discrete-SLM/perplexity comparison to be a
