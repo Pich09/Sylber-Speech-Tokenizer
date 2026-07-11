@@ -147,6 +147,75 @@ happens, treat Sylber's CTC probe as blocked, and if you want any
 usable pilot signal in the meantime, it's HuBERT's (with the caveat that
 240/8-epochs is still too small to mean much either).
 
+### Free lever found: `merge_threshold` (before committing to Step 3)
+
+Sylber's segment boundaries come from a fixed, rule-based heuristic
+(`sylber.utils.segment_utils.get_segment`), not a learned head: a frame is
+"voiced" above `norm_threshold` (default 2.6), and consecutive voiced
+frames merge into one segment while their running-average cosine
+similarity stays ≥ `merge_threshold` (default 0.8) — both fixed,
+English-tuned constants. `src/segmentation.py sweep-thresholds` (new) sweeps
+these against real Khmer data with zero training and zero annotation —
+just re-running the cheap thresholding step on cached backbone hidden
+states — to see how much of the T<L gap is a tunable-threshold artifact
+versus something only backbone fine-tuning can fix.
+
+Result, same 30-utterance sample as the pilot above (`norm_threshold` barely
+matters; `merge_threshold` is the dominant lever):
+
+| merge_threshold | mean_token_rate_hz | mean T/L | % utterances CTC-viable (T≥L) |
+|---|---|---|---|
+| 0.80 (Sylber's default) | 4.45 | 0.66 | 0% |
+| 0.95 | 5.61 | 0.83 | 6.7% |
+| 0.97 | 6.18 | 0.92 | 20% |
+| **0.98** | **6.81** | **1.01** | **66.7%** |
+| 0.99 | 8.26 | 1.23 | 96.7% |
+| 0.995 | 10.43 | 1.55 | 100% |
+| 0.999 | 21.54 | 3.22 | 100% |
+
+There's a real tradeoff, not a free lunch: pushing `merge_threshold` high
+enough gets 100% CTC-viability, but by ~0.99 the token rate is already
+8-10Hz and by 0.999 it's 21Hz+ — no longer "syllabic" at all, just
+frame-level fragmentation wearing the segmentation API. That defeats the
+actual point of using Sylber (compact ~4-5Hz tokens) even if it makes the
+CTC probe's `T≥L` check pass. **`merge_threshold≈0.98` is the practical
+sweet spot**: token rate only ~36% above the 4-5Hz reference band (not
+2-4x), mean T/L≈1.01 (right at parity), and 2/3 of utterances become
+CTC-viable — recovering most of the usable signal without abandoning the
+syllable-rate property that makes Sylber worth using over a frame-level
+encoder in the first place.
+
+**Confirmed by actually running the CTC probe** (not just the segmentation
+proxy stats above) — `python src/train_ctc.py train --encoder sylber
+--merge-threshold 0.98 --epochs 8` on the same 240/30 pilot split:
+
+| | default (merge_threshold=0.8) | merge_threshold=0.98 |
+|---|---|---|
+| train used/skipped | 0/240 | **154/240** |
+| val used/skipped | 0/30 | **22/30** |
+| train_loss trend | flat 0.0000 (nothing computed) | 6.08 → 5.24 → 4.70 → 4.62 → 4.56 → 4.51 → 4.47 → **4.45** |
+| final val_cer | 0.0 (false zero, no comparisons made) | **0.868** |
+
+Sylber's CER (0.868) at `merge_threshold=0.98` is now actually *lower*
+(better) than HuBERT's 0.987 at this same tiny pilot scale — though both
+numbers are still not trustworthy in absolute terms at 240
+utterances/8 epochs, this is the first time Sylber has produced **any**
+real, non-degenerate CTC signal at all, closing the loop from a total
+blocker to a working (if still small-scale) comparison.
+
+`--norm-threshold`/`--merge-threshold` are now wired through
+`train_ctc.py`/`encoders.py load_encoder`/`segmentation.load_segmenter`,
+and `python src/segmentation.py sweep-thresholds` runs the free,
+zero-training sweep itself (see table above).
+
+**Recommendation**: use `--merge-threshold 0.98` as the default for any
+further Sylber CTC-probe runs (a full 20h+ run, not just this 300-utterance
+smoke test) before spending the Step 3 annotation effort — then decide
+whether the remaining gap (~36% of utterances still skipped) is worth the
+Step 3 fine-tune on top. Even after the threshold fix, remember the CER
+itself still needs a much larger run to be trustworthy — this only fixes
+"can we compute a number at all," not "is the number meaningful yet."
+
 ## Option B — Scale audio to match token count (fix the SLM comparison itself)
 
 If you still want the discrete-SLM/perplexity comparison to be a

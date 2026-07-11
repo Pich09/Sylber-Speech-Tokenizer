@@ -241,7 +241,10 @@ def cmd_train(args):
     blank_id = len(char2id)
     log.info("Grapheme-cluster vocab size=%d (+1 CTC blank) built from %d train transcripts", len(char2id), len(train_df))
 
-    encoder = load_encoder(args.encoder, checkpoint=args.checkpoint, device=device)
+    encoder = load_encoder(
+        args.encoder, checkpoint=args.checkpoint, device=device,
+        norm_threshold=args.norm_threshold, merge_threshold=args.merge_threshold,
+    )
 
     # Infer hidden size from one utterance's features rather than assuming
     # a fixed dim, since sylber/hubert/whisper each expose a different one.
@@ -344,6 +347,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--dropout", type=float, default=0.1)
     p_train.add_argument("--warmup-ratio", type=float, default=0.05, help="linear warmup fraction of total steps; 0 disables the scheduler")
     p_train.add_argument("--device", default=None)
+    p_train.add_argument(
+        "--norm-threshold", type=float, default=None,
+        help="sylber only: override its fixed voice-activity threshold (default 2.6); see "
+        "docs/post-benchmark-roadmap.md's 'Free lever found' section",
+    )
+    p_train.add_argument(
+        "--merge-threshold", type=float, default=None,
+        help="sylber only: override its fixed segment-merge cosine-similarity threshold (default 0.8) "
+        "— raising it (e.g. 0.98) closes most of the T<L gap that skips every Sylber utterance at the "
+        "default; see docs/post-benchmark-roadmap.md's 'Free lever found' section",
+    )
     p_train.set_defaults(func=cmd_train)
 
     return parser

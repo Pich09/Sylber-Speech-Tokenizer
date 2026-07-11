@@ -119,16 +119,26 @@ def resolve_checkpoint(name: str, checkpoint: str | None) -> str:
     raise ValueError(f"unknown encoder {name!r}; expected one of sylber, hubert, whisper")
 
 
-def load_encoder(name: str, checkpoint: str | None = None, device: str | None = None):
+def load_encoder(
+    name: str,
+    checkpoint: str | None = None,
+    device: str | None = None,
+    norm_threshold: float | None = None,
+    merge_threshold: float | None = None,
+):
     """Factory matching `segmentation.load_segmenter`'s role for the
     non-Sylber encoders. `name` selects the adapter; `checkpoint` overrides
     the default HF model id (ignored for "sylber", which uses its own
-    checkpoint-name convention)."""
+    checkpoint-name convention). `norm_threshold`/`merge_threshold` override
+    Sylber's fixed segmentation heuristic (sylber-only; ignored otherwise —
+    see `segmentation.load_segmenter` and `docs/post-benchmark-roadmap.md`'s
+    "Free lever found" section for why the default merge_threshold=0.8
+    under-segments Khmer)."""
     resolved = resolve_checkpoint(name, checkpoint)
     if name == "sylber":
         from segmentation import load_segmenter
 
-        return load_segmenter(resolved)
+        return load_segmenter(resolved, norm_threshold=norm_threshold, merge_threshold=merge_threshold)
     if name == "hubert":
         return HubertEncoder(resolved, device=device)
     if name == "whisper":

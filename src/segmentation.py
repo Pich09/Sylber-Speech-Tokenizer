@@ -5,6 +5,10 @@ Zero-shot eval (Step 2):
     python src/segmentation.py eval --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
         --n-samples 100 --out results/zero_shot_evaluation.txt
 
+Threshold sweep (free, zero-training check before committing to Step 3):
+    python src/segmentation.py sweep-thresholds --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
+        --n-samples 30 --out results/threshold_sweep.csv
+
 Fine-tuning (Step 3):
     python src/segmentation.py finetune --manifest ... --mode last_layer \
         --init-ckpt sylber --out-ckpt checkpoints/sylber_khmer_v1.pth
@@ -150,6 +154,108 @@ def cmd_eval(args):
     log.info(
         "Decision point: if manual inspection of boundaries is >=80%% accurate, "
         "skip Step 3 and go straight to discretization (Step 4). Otherwise fine-tune."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Threshold sweep — a free, zero-training alternative/precursor to Step 3
+# ---------------------------------------------------------------------------
+# get_segment()'s norm_threshold/merge_threshold are fixed, English-tuned
+# constants (2.6/0.8), never swept. Since Sylber's zero-shot Khmer token
+# count runs ~34% below the grapheme-cluster label length on average (see
+# docs/post-benchmark-roadmap.md's pilot result), it's worth checking how
+# much of that gap a different threshold closes before committing to the
+# annotation-heavy Step 3 fine-tune. Each utterance's backbone hidden
+# states are computed once and cached, then get_segment() (cheap — no
+# backbone forward pass) is re-run per threshold combo directly on the
+# cached states, so the sweep doesn't pay repeated GPU cost per combo.
+
+
+def extract_hidden_states_and_labels(segmenter, df: pd.DataFrame) -> list[dict]:
+    """One backbone forward pass per utterance, cached alongside the
+    transcript's grapheme-cluster label length (see train_ctc.py's
+    tokenize_transcript) so the threshold sweep below can re-run
+    get_segment() cheaply per combo without repeating this."""
+    import soundfile as sf
+
+    from train_ctc import tokenize_transcript  # local import: src/ on path
+
+    cache = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="extracting hidden states"):
+        audio, sr = sf.read(row["path"], dtype="float32")
+        # match sylber.Segmenter.__call__'s own preprocessing
+        audio = (audio - audio.mean()) / audio.std()
+        wav_tensor = torch.from_numpy(audio).unsqueeze(0).to(segmenter.device)
+        with torch.no_grad():
+            hidden_states = segmenter.speech_model(wav_tensor).last_hidden_state.squeeze(0).cpu().numpy()
+
+        transcript = row.get("transcript", "") or ""
+        label_len = len(tokenize_transcript(transcript)) if transcript else None
+        cache.append(
+            {
+                "path": row["path"],
+                "hidden_states": hidden_states,
+                "label_len": label_len,
+                "duration_sec": row.get("duration_sec"),
+            }
+        )
+    return cache
+
+
+def sweep_thresholds(cache: list[dict], norm_thresholds: list[float], merge_thresholds: list[float]) -> pd.DataFrame:
+    from sylber.utils.segment_utils import get_segment
+
+    rows = []
+    for nt in norm_thresholds:
+        for mt in merge_thresholds:
+            token_rates, ratios = [], []
+            n_viable = n_with_label = 0
+            for item in cache:
+                segments = get_segment(item["hidden_states"], nt, mt)
+                T = len(segments)
+                if item["duration_sec"]:
+                    token_rates.append(T / item["duration_sec"])
+                if item["label_len"]:
+                    n_with_label += 1
+                    ratios.append(T / item["label_len"])
+                    if T >= item["label_len"]:
+                        n_viable += 1
+            rows.append(
+                {
+                    "norm_threshold": nt,
+                    "merge_threshold": mt,
+                    "mean_token_rate_hz": float(np.mean(token_rates)) if token_rates else float("nan"),
+                    "mean_T_over_L": float(np.mean(ratios)) if ratios else float("nan"),
+                    "pct_ctc_viable": n_viable / n_with_label if n_with_label else float("nan"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def cmd_sweep_thresholds(args):
+    df = pd.read_csv(args.manifest)
+    df["transcript"] = df.get("transcript", pd.Series(dtype=str)).fillna("")
+    sample = df.sample(n=min(args.n_samples, len(df)), random_state=42)
+
+    segmenter = load_segmenter(args.checkpoint)
+    cache = extract_hidden_states_and_labels(segmenter, sample)
+
+    result = sweep_thresholds(cache, args.norm_thresholds, args.merge_thresholds)
+    result = result.sort_values(["pct_ctc_viable", "mean_T_over_L"], ascending=[False, True])
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(out_path, index=False)
+
+    log.info("Threshold sweep (n=%d utterances):\n%s", len(cache), result.to_string(index=False))
+    log.info("Wrote %s", out_path)
+    best = result.iloc[0]
+    log.info(
+        "Best by pct_ctc_viable: norm_threshold=%.2f merge_threshold=%.2f -> "
+        "pct_ctc_viable=%.1f%% mean_T/L=%.2f mean_token_rate_hz=%.2f "
+        "(Sylber's own default is norm_threshold=2.6, merge_threshold=0.8)",
+        best["norm_threshold"], best["merge_threshold"], best["pct_ctc_viable"] * 100,
+        best["mean_T_over_L"], best["mean_token_rate_hz"],
     )
 
 
@@ -364,6 +470,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--n-samples", type=int, default=100)
     p_eval.add_argument("--out", default="results/zero_shot_evaluation.txt")
     p_eval.set_defaults(func=cmd_eval)
+
+    p_sweep = sub.add_parser(
+        "sweep-thresholds",
+        help="free, zero-training check: does a different norm_threshold/merge_threshold close the T<L gap",
+    )
+    p_sweep.add_argument("--manifest", required=True)
+    p_sweep.add_argument("--checkpoint", default="sylber")
+    p_sweep.add_argument("--n-samples", type=int, default=30)
+    p_sweep.add_argument("--norm-thresholds", type=float, nargs="+", default=[1.5, 2.0, 2.3, 2.6, 3.0, 3.5])
+    p_sweep.add_argument("--merge-thresholds", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95])
+    p_sweep.add_argument("--out", default="results/threshold_sweep.csv")
+    p_sweep.set_defaults(func=cmd_sweep_thresholds)
 
     p_ft = sub.add_parser("finetune", help="Step 3: fine-tune Sylber's backbone on Khmer boundary supervision")
     p_ft.add_argument("--manifest", required=True)
