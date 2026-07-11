@@ -73,7 +73,9 @@ def resample_and_trim(audio: np.ndarray, orig_sr: int, do_vad: bool = True) -> n
 def process_hf_dataset(
     dataset_name: str, out_dir: Path, splits: dict, do_vad: bool = True, max_samples: int | None = None
 ) -> pd.DataFrame:
-    from datasets import load_dataset
+    import io
+
+    from datasets import Audio, load_dataset
 
     out_dir.mkdir(parents=True, exist_ok=True)
     audio_dir = out_dir / "wav16k"
@@ -89,16 +91,27 @@ def process_hf_dataset(
 
         log.info("Streaming %s from Hugging Face, capped at %d examples...", dataset_name, max_samples)
         ds = load_dataset(dataset_name, split="train", streaming=True)
+        # `decode=False` + manual soundfile decode instead of `datasets`'
+        # default Audio decoder, which (as of datasets>=~4) shells out to
+        # torchcodec and needs system ffmpeg/libavutil — not guaranteed
+        # present outside e.g. Colab's preinstalled image. soundfile is
+        # already a hard dependency of this repo (used for VAD/resampling
+        # below), so this avoids that extra system requirement entirely.
+        # Must cast before islice: islice's plain generator has no
+        # cast_column, so this has to happen on the IterableDataset first.
+        ds = ds.cast_column("audio", Audio(decode=False))
         ds = itertools.islice(ds, max_samples)
     else:
         log.info("Loading %s from Hugging Face (this downloads the full corpus)...", dataset_name)
         ds = load_dataset(dataset_name, split="train")
+        ds = ds.cast_column("audio", Audio(decode=False))
 
     rows = []
     for i, example in enumerate(tqdm(ds, desc=f"processing {dataset_name}", total=max_samples)):
         audio = example["audio"]
-        y = np.asarray(audio["array"], dtype=np.float32)
-        sr = audio["sampling_rate"]
+        y, sr = sf.read(io.BytesIO(audio["bytes"]), dtype="float32")
+        if y.ndim > 1:
+            y = y.mean(axis=1)
         y = resample_and_trim(y, sr, do_vad=do_vad)
 
         out_path = audio_dir / f"{dataset_name.split('/')[-1]}_{i:07d}.wav"
