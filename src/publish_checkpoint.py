@@ -44,11 +44,14 @@ Sylber encoder ([Berkeley-Speech-Group/sylber](https://github.com/Berkeley-Speec
 base checkpoint `{init_ckpt}`) fine-tuned on Khmer speech.
 
 - **Fine-tune mode**: `{mode}` ({mode_desc})
-- **Files**: `sylber_khmer.pth` — a dict with `backbone_state_dict`,
-  `boundary_head_state_dict`, `mode`, `init_ckpt`, as written by
-  `src/segmentation.py`'s `finetune_segmenter`. Load via `torch.load(...)`
-  and restore into a `sylber.Segmenter`'s `.model` (backbone) — see
-  `src/tokenizer.py`/`src/segmentation.py` in
+- **Files**: `sylber_khmer.pth` — a dict with `backbone_state_dict`, `mode`,
+  `init_ckpt`, as written by `src/segmentation.py`'s `finetune_segmenter`.
+  This is Sylber's backbone (`sylber.Segmenter`'s `.speech_model`, a
+  HubertModel) fine-tuned with a boundary-contrastive loss — Sylber has no
+  separate learned boundary head, so there's nothing else to load. Load via
+  `src/segmentation.py`'s `load_segmenter(<this checkpoint's path>)`, which
+  handles restoring `backbone_state_dict` into a fresh `Segmenter` built
+  from `init_ckpt` — see that module in
   [Sylber-Speech-Tokenizer](https://github.com/Pich09/Sylber-Speech-Tokenizer)
   for the loading convention this checkpoint follows.
 
@@ -75,8 +78,8 @@ redistributing.
 """
 
 MODE_DESCRIPTIONS = {
-    "head_only": "backbone frozen, only the boundary head was fine-tuned",
-    "full_model": "backbone + boundary head both fine-tuned",
+    "last_layer": "backbone frozen except the last transformer layer",
+    "full_model": "entire backbone fine-tuned",
 }
 
 

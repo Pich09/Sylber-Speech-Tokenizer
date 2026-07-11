@@ -23,7 +23,7 @@ isn't on PyPI. GPU with CUDA is strongly recommended for Steps 3/5/6.
 |---|---|---|
 | 1. Data | `data/preprocessing/prepare_data.py` | Download DDD-Cambodia corpus from HF, resample to 16kHz, VAD-trim, split train/val/test, write manifest CSV |
 | 2. Zero-shot eval | `src/segmentation.py eval` | Run pretrained Sylber on a sample of Khmer audio, report token rate + save results |
-| 3. Fine-tune | `src/segmentation.py finetune` | Fine-tune the boundary head (`head_only`) or full backbone (`full_model`) on pseudo/corrected Khmer boundaries |
+| 3. Fine-tune | `src/segmentation.py finetune` | Fine-tune Sylber's backbone (last layer only, `last_layer`, or the whole backbone, `full_model`) against pseudo/corrected Khmer boundaries — Sylber has no separate learned boundary head to isolate; see "Fine-tuning caveat" below |
 | 4. Discretize | `src/discretization.py extract / sweep / fit` | Extract syllable-mean-pooled embeddings, sweep K, fit final k-means vocabulary |
 | — | `src/tokenizer.py encode` | End-to-end: raw wav -> discrete token IDs, via the fitted encoder + k-means |
 | 5/6. SLM | `src/train_slm.py encode / train` | Encode a manifest to token sequences, continue-pretrain OPT-125M on them, report perplexity |
@@ -41,7 +41,7 @@ python src/segmentation.py eval --manifest data/preprocessing/manifests/khmer-sp
 
 # if zero-shot boundary agreement is <80% on manual inspection:
 python src/segmentation.py finetune --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
-    --boundaries data/annotations/corrected_boundaries.json --mode head_only \
+    --boundaries data/annotations/corrected_boundaries.json --mode last_layer \
     --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
 
 python src/discretization.py extract --manifest data/preprocessing/manifests/khmer-speech-dataset_manifest.csv \
@@ -54,6 +54,23 @@ python src/train_slm.py encode --manifest data/preprocessing/manifests/khmer-spe
     --encoder sylber --out data/tokens/sylber_tokens.jsonl
 python src/train_slm.py train --tokens data/tokens/sylber_tokens.jsonl --encoder sylber
 ```
+
+## Fine-tuning caveat: Sylber has no learned boundary head
+
+Sylber's segment boundaries come from a fixed, rule-based heuristic over
+the backbone's own hidden states (`sylber.utils.segment_utils.get_segment`):
+a frame counts as voiced if its L2-norm clears `norm_threshold` (default
+2.6), and consecutive voiced frames merge into one segment while their
+running-average cosine similarity stays above `merge_threshold` (default
+0.8) — both fixed, English-tuned constants, not learned parameters. There
+is no separate boundary classifier to isolate and fine-tune. `--mode
+last_layer` freezes all but the backbone's last transformer layer (the
+conservative, sample-efficient option, in place of what used to be called
+`head_only`); `--mode full_model` unfreezes the whole backbone. Either way,
+`finetune_segmenter` trains directly against a boundary-contrastive loss on
+the backbone's hidden states — pulling adjacent-frame similarity up within
+a target segment and down across a target boundary — since that's the same
+quantity `get_segment()` actually thresholds at inference time.
 
 ## Two paths after Step 2/3
 

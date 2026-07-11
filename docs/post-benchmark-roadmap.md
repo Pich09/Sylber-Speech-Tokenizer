@@ -140,9 +140,9 @@ this scale" like the SLM path was:
 **This is not a code bug to keep chasing** — `T < L` here reflects actual
 segmentation quality, and no amount of CTC-probe-side fixing (grapheme
 clustering already applied) can manufacture tokens Sylber didn't produce.
-It's concrete evidence for backup-ladder step 1 above: **fine-tune the
-boundary head on Khmer (Step 3) before the CTC probe can produce a usable
-Sylber number at all**, not just before trusting it. Until that fine-tune
+It's concrete evidence for backup-ladder step 1 above: **fine-tune Sylber's
+backbone on Khmer boundary supervision (Step 3) before the CTC probe can
+produce a usable Sylber number at all**, not just before trusting it. Until that fine-tune
 happens, treat Sylber's CTC probe as blocked, and if you want any
 usable pilot signal in the meantime, it's HuBERT's (with the caveat that
 240/8-epochs is still too small to mean much either).

@@ -78,7 +78,7 @@ All commands below assume `cwd` = repo root, venv activated.
    into a `boundaries.json` (`{wav_path: [[start,end], ...]}`) — there's no script for this
    annotation step, it's manual linguistic work. Then:
    ```bash
-   python src/segmentation.py finetune --manifest <manifest.csv> --boundaries data/annotations/corrected_boundaries.json --mode head_only --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
+   python src/segmentation.py finetune --manifest <manifest.csv> --boundaries data/annotations/corrected_boundaries.json --mode last_layer --out-ckpt models/sylber_checkpoints/sylber_khmer_v1.pth
    ```
    Confirm: loss should trend down across epochs in the log; compare boundary agreement on a
    held-out set against the zero-shot baseline.
@@ -150,10 +150,13 @@ All commands below assume `cwd` = repo root, venv activated.
    python src/publish_checkpoint.py --checkpoint models/sylber_checkpoints/sylber_khmer_v1.pth \
        --repo-id Panhapich/syllber-based-audio-encoder --push
    ```
-   `--mode full_model` unfreezes the whole backbone (not just the boundary head), which is what
-   makes this different from step 3's conditional fine-tune even if step 3 was skipped because
-   zero-shot passed — step 3 is about fixing bad boundaries, this is about deliberately adapting
-   the encoder to Khmer acoustics for downstream reuse. `--push` needs `huggingface-cli login` or
+   `--mode full_model` unfreezes the whole backbone (not just its last transformer layer, as
+   `--mode last_layer` does), which is what makes this different from step 3's conditional
+   fine-tune even if step 3 was skipped because zero-shot passed — step 3 is about fixing bad
+   boundaries, this is about deliberately adapting the encoder to Khmer acoustics for downstream
+   reuse. See the README's "Fine-tuning caveat" section: Sylber has no separate learned boundary
+   head, so both modes fine-tune the backbone itself against a boundary-contrastive loss, not a
+   classifier. `--push` needs `huggingface-cli login` or
    an `HF_TOKEN` env var set on the GPU machine first; it creates the Hub repo **private** by
    default (`--public` to change that). Note DDD-Cambodia is CC-BY-SA-4.0 — check share-alike
    license implications before making a derived checkpoint public.

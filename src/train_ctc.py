@@ -94,9 +94,8 @@ def greedy_ctc_decode(logits: torch.Tensor, blank_id: int) -> list[int]:
 
 class CTCHead(nn.Module):
     """Small supervised decoder on top of frozen encoder features — the
-    "probe" in CTC-probe. One hidden layer (matching segmentation.py's
-    BoundaryHead style) rather than a bare linear layer, for a bit more
-    capacity without turning this into a full ASR model."""
+    "probe" in CTC-probe. One hidden layer rather than a bare linear layer,
+    for a bit more capacity without turning this into a full ASR model."""
 
     def __init__(self, hidden_size: int, vocab_size: int, dropout: float = 0.1):
         super().__init__()
@@ -183,8 +182,7 @@ def run_epoch(
                 continue
 
             # Eval passes never call .backward(), so skip building the
-            # autograd graph through the head for them (same wasted-VRAM
-            # pattern already fixed in segmentation.py's head_only mode).
+            # autograd graph through the head for them.
             with torch.enable_grad() if training else torch.no_grad():
                 logits = head(feats)  # (T, V+1)
                 log_probs = F.log_softmax(logits, dim=-1).unsqueeze(1)  # (T, 1, V+1)

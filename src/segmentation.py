@@ -6,7 +6,7 @@ Zero-shot eval (Step 2):
         --n-samples 100 --out results/zero_shot_evaluation.txt
 
 Fine-tuning (Step 3):
-    python src/segmentation.py finetune --manifest ... --mode head_only \
+    python src/segmentation.py finetune --manifest ... --mode last_layer \
         --init-ckpt sylber --out-ckpt checkpoints/sylber_khmer_v1.pth
 """
 from __future__ import annotations
@@ -21,7 +21,6 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
@@ -30,16 +29,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 
-def load_segmenter(checkpoint: str = "sylber"):
-    """Load a pretrained Sylber segmenter.
+def load_segmenter(checkpoint: str = "sylber", norm_threshold: float | None = None, merge_threshold: float | None = None):
+    """Load a pretrained (or Khmer-fine-tuned) Sylber segmenter.
 
     Requires the `sylber` package (Berkeley-Speech-Group/sylber). Import is
     lazy so the rest of this module (config/manifest handling) can be tested
     without the heavy model dependency installed.
+
+    `sylber.Segmenter(model_ckpt=...)` expects `checkpoint` to point at its
+    *own* raw HubertModel state_dict (or the "sylber" HF Hub name) — not the
+    `{"backbone_state_dict": ..., "init_ckpt": ...}` wrapper this module's
+    `finetune_segmenter`/`publish_checkpoint.py` write. Passing one of those
+    straight through would silently no-op under `strict=False` (no keys
+    would match). Detect that case and load it the right way: build the
+    Segmenter from its recorded base checkpoint, then overlay the
+    fine-tuned backbone weights.
+
+    `norm_threshold`/`merge_threshold` override Sylber's fixed segmentation
+    heuristic (see `sylber.utils.segment_utils.get_segment`) — the L2-norm
+    voice-activity cutoff and the cosine-similarity merge cutoff, English-
+    tuned defaults of 2.6/0.8 respectively. None keeps Sylber's own default.
     """
     from sylber import Segmenter
 
-    return Segmenter(model_ckpt=checkpoint)
+    kwargs = {}
+    if norm_threshold is not None:
+        kwargs["norm_threshold"] = norm_threshold
+    if merge_threshold is not None:
+        kwargs["merge_threshold"] = merge_threshold
+
+    if checkpoint not in (None, "sylber") and Path(checkpoint).exists():
+        ckpt = torch.load(checkpoint, map_location="cpu")
+        if isinstance(ckpt, dict) and "backbone_state_dict" in ckpt:
+            segmenter = Segmenter(model_ckpt=ckpt.get("init_ckpt", "sylber"), **kwargs)
+            segmenter.speech_model.load_state_dict(ckpt["backbone_state_dict"], strict=False)
+            return segmenter
+
+    return Segmenter(model_ckpt=checkpoint, **kwargs)
 
 
 @dataclass
@@ -130,37 +156,57 @@ def cmd_eval(args):
 # ---------------------------------------------------------------------------
 # Step 3: Fine-tuning
 # ---------------------------------------------------------------------------
-# Sylber's released checkpoint wraps a HuBERT-style CNN+Transformer backbone
-# plus a segmentation head that scores frame-to-frame boundary probability.
-# We fine-tune that boundary head (and optionally the backbone) against
-# pseudo-labels: zero-shot segmentations, manually corrected on a small
-# subset, used as the boundary-detection training target.
+# Sylber has no separate learned boundary-prediction head to fine-tune.
+# Segment boundaries come from a fixed, rule-based heuristic applied to the
+# backbone's own hidden states (sylber.utils.segment_utils.get_segment): a
+# frame counts as voiced if its L2-norm >= norm_threshold, and consecutive
+# voiced frames merge into one segment while their running-average cosine
+# similarity stays >= merge_threshold (English-tuned defaults 2.6/0.8).
+# There's nothing to attach a classifier head to, and get_segment() would
+# never consult one anyway. So instead of training a disconnected boundary
+# classifier, this fine-tunes the backbone directly with a loss that targets
+# the same quantity get_segment() actually thresholds: pull adjacent-frame
+# cosine similarity up within a true target segment (so get_segment merges
+# them) and down across a true target boundary (so get_segment splits there).
 
 
-class BoundaryHead(nn.Module):
-    """Frame-level boundary classifier on top of backbone hidden states."""
-
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.net(hidden_states).squeeze(-1)  # (B, T) boundary logits
+def frames_to_segment_ids(segments: list[tuple[float, float]], n_frames: int, frame_stride_sec: float) -> torch.Tensor:
+    """Per-frame target segment index (by `segments`' order); -1 for frames
+    not covered by any target segment (e.g. silence/gaps — get_segment's
+    separate norm_threshold voice-activity check already handles those, so
+    they're excluded from the boundary-contrastive loss below rather than
+    guessed at)."""
+    seg_ids = torch.full((n_frames,), -1, dtype=torch.long)
+    for i, (start, end) in enumerate(segments):
+        s = min(int(round(start / frame_stride_sec)), n_frames - 1)
+        e = min(max(int(round(end / frame_stride_sec)), s + 1), n_frames)
+        seg_ids[s:e] = i
+    return seg_ids
 
 
-def frames_to_boundary_labels(segments: list[tuple[float, float]], n_frames: int, frame_stride_sec: float) -> torch.Tensor:
-    """Convert (start, end) syllable segments into a per-frame binary label
-    that is 1 at the frame closest to each segment boundary, 0 elsewhere."""
-    labels = torch.zeros(n_frames)
-    for start, _end in segments:
-        frame_idx = min(int(round(start / frame_stride_sec)), n_frames - 1)
-        labels[frame_idx] = 1.0
-    return labels
+def boundary_contrastive_loss(hidden_states: torch.Tensor, seg_ids: torch.Tensor, margin: float) -> torch.Tensor | None:
+    """(T, D) hidden states + (T,) target segment ids -> a scalar loss
+    mirroring get_segment()'s own merge decision: adjacent-frame cosine
+    similarity should be high within a target segment (so get_segment merges
+    them) and below `margin` across a target boundary (so it splits there).
+    `margin` should generally be at or below the merge_threshold get_segment
+    will actually run with at inference, so a successful fit produces
+    similarities its own check will act on. Returns None if there are no
+    valid (non-gap) adjacent frame pairs to learn from."""
+    seg_i, seg_j = seg_ids[:-1], seg_ids[1:]
+    valid = (seg_i >= 0) & (seg_j >= 0)
+    if not valid.any():
+        return None
+
+    sims = F.cosine_similarity(hidden_states[:-1][valid], hidden_states[1:][valid], dim=-1)
+    same = seg_i[valid] == seg_j[valid]
+
+    losses = []
+    if same.any():
+        losses.append((1.0 - sims[same]).mean())
+    if (~same).any():
+        losses.append(F.relu(sims[~same] - margin).mean())
+    return torch.stack(losses).mean() if losses else None
 
 
 class KhmerSegmentationDataset(torch.utils.data.Dataset):
@@ -183,39 +229,48 @@ def finetune_segmenter(
     boundaries_json: str,
     init_ckpt: str,
     out_ckpt: str,
-    mode: Literal["head_only", "full_model"] = "head_only",
+    mode: Literal["last_layer", "full_model"] = "last_layer",
     lr: float = 1e-4,
     epochs: int = 10,
     batch_size: int = 8,
     frame_stride_sec: float = 0.02,
+    margin: float = 0.75,
     device: str | None = None,
 ):
-    """Fine-tune Sylber's boundary head (Step 3).
+    """Fine-tune Sylber's backbone on Khmer boundary supervision (Step 3).
 
     `boundaries_json` maps wav path -> list of [start, end] pseudo/corrected
     segment boundaries (seconds), produced by zero-shot inference + manual
     correction on ~500-1000 utterances (see doc Step 3.1).
 
-    `mode="head_only"` freezes the CNN+Transformer backbone and only trains
-    BoundaryHead — the conservative, sample-efficient strategy. `mode="full_model"`
-    unfreezes everything, viable once enough Khmer hours are available (~728h).
+    `mode="last_layer"` freezes all but the backbone's last transformer
+    layer — the conservative, sample-efficient strategy. `mode="full_model"`
+    unfreezes everything, viable once enough Khmer hours are available
+    (~728h). (No "head_only" option — see the module-level note above on
+    why Sylber has no boundary head to isolate.)
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     segmenter = load_segmenter(init_ckpt)
-    backbone = segmenter.model  # HuBERT-style nn.Module exposed by sylber.Segmenter
-    hidden_size = backbone.config.hidden_size if hasattr(backbone, "config") else backbone.hidden_size
+    backbone = segmenter.speech_model  # the HubertModel sylber.Segmenter actually wraps
 
-    if mode == "head_only":
-        for p in backbone.parameters():
-            p.requires_grad = False
+    for p in backbone.parameters():
+        p.requires_grad = False
+    if mode == "last_layer":
+        if not hasattr(backbone, "encoder") or not hasattr(backbone.encoder, "layers"):
+            raise RuntimeError(
+                "backbone.encoder.layers not found; the installed sylber/transformers version's "
+                "HubertModel structure doesn't match what mode='last_layer' assumes — use "
+                "mode='full_model' instead, or adjust this spot."
+            )
+        for p in backbone.encoder.layers[-1].parameters():
+            p.requires_grad = True
     elif mode == "full_model":
         for p in backbone.parameters():
             p.requires_grad = True
     else:
         raise ValueError(f"unknown mode {mode!r}")
 
-    head = BoundaryHead(hidden_size).to(device)
     backbone.to(device)
 
     df = pd.read_csv(manifest_path)
@@ -226,61 +281,56 @@ def finetune_segmenter(
 
     dataset = KhmerSegmentationDataset(df, boundaries)
 
-    trainable_params = list(head.parameters())
-    if mode == "full_model":
-        trainable_params += list(backbone.parameters())
+    trainable_params = [p for p in backbone.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
 
     import soundfile as sf
 
-    backbone.train(mode == "full_model")
-    head.train()
+    backbone.train()
 
     for epoch in range(epochs):
         epoch_loss = 0.0
         n_batches = 0
+        n_skipped = 0
         loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda b: b
         )
         for batch in tqdm(loader, desc=f"epoch {epoch + 1}/{epochs}"):
             optimizer.zero_grad()
-            batch_loss = 0.0
+            batch_losses = []
             for wav_path, segs in batch:
                 audio, sr = sf.read(wav_path, dtype="float32")
+                # Match sylber.Segmenter.__call__'s own preprocessing so
+                # fine-tuning sees the same input distribution as inference.
+                audio = (audio - audio.mean()) / audio.std()
                 wav_tensor = torch.from_numpy(audio).unsqueeze(0).to(device)
 
-                # head_only freezes backbone params, but without no_grad() autograd
-                # still builds a backward graph through its activations (needed to
-                # flow gradients into the head), costing nearly full_model VRAM.
-                backbone_ctx = torch.no_grad() if mode == "head_only" else torch.enable_grad()
-                with backbone_ctx:
-                    hidden_states = backbone.extract_features(wav_tensor) if hasattr(
-                        backbone, "extract_features"
-                    ) else backbone(wav_tensor).last_hidden_state
-                if mode == "head_only":
-                    hidden_states = hidden_states.detach()
+                hidden_states = backbone(wav_tensor).last_hidden_state.squeeze(0)  # (T, D)
+                seg_ids = frames_to_segment_ids(segs, hidden_states.shape[0], frame_stride_sec).to(device)
+                loss = boundary_contrastive_loss(hidden_states, seg_ids, margin)
+                if loss is None:
+                    n_skipped += 1
+                    continue
+                batch_losses.append(loss)
 
-                logits = head(hidden_states)  # (1, T)
-                labels = frames_to_boundary_labels(segs, logits.shape[1], frame_stride_sec).to(device)
-                loss = F.binary_cross_entropy_with_logits(logits.squeeze(0), labels)
-                loss.backward()
-                batch_loss += loss.item()
-
+            if not batch_losses:
+                continue
+            batch_loss = torch.stack(batch_losses).mean()
+            batch_loss.backward()
             optimizer.step()
-            epoch_loss += batch_loss
+            epoch_loss += batch_loss.item()
             n_batches += 1
 
-        log.info("epoch %d/%d mean loss=%.4f", epoch + 1, epochs, epoch_loss / max(n_batches, 1))
+        log.info(
+            "epoch %d/%d mean loss=%.4f (batches used=%d, utterances skipped=%d — fewer than 2 "
+            "non-gap frames of target segmentation)",
+            epoch + 1, epochs, epoch_loss / max(n_batches, 1), n_batches, n_skipped,
+        )
 
     out_path = Path(out_ckpt)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
-        {
-            "backbone_state_dict": backbone.state_dict(),
-            "boundary_head_state_dict": head.state_dict(),
-            "mode": mode,
-            "init_ckpt": init_ckpt,
-        },
+        {"backbone_state_dict": backbone.state_dict(), "mode": mode, "init_ckpt": init_ckpt},
         out_path,
     )
     log.info("Saved fine-tuned checkpoint to %s", out_path)
@@ -300,6 +350,7 @@ def cmd_finetune(args):
         lr=args.lr,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        margin=args.margin,
     )
 
 
@@ -314,15 +365,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--out", default="results/zero_shot_evaluation.txt")
     p_eval.set_defaults(func=cmd_eval)
 
-    p_ft = sub.add_parser("finetune", help="Step 3: fine-tune boundary head on Khmer")
+    p_ft = sub.add_parser("finetune", help="Step 3: fine-tune Sylber's backbone on Khmer boundary supervision")
     p_ft.add_argument("--manifest", required=True)
     p_ft.add_argument("--boundaries", required=True, help="JSON: wav_path -> [[start,end], ...]")
     p_ft.add_argument("--init-ckpt", default="sylber")
     p_ft.add_argument("--out-ckpt", default="models/sylber_checkpoints/sylber_khmer_v1.pth")
-    p_ft.add_argument("--mode", choices=["head_only", "full_model"], default="head_only")
+    p_ft.add_argument("--mode", choices=["last_layer", "full_model"], default="last_layer")
     p_ft.add_argument("--lr", type=float, default=1e-4)
     p_ft.add_argument("--epochs", type=int, default=10)
     p_ft.add_argument("--batch-size", type=int, default=8)
+    p_ft.add_argument(
+        "--margin", type=float, default=0.75,
+        help="cosine-similarity margin for cross-boundary frame pairs; keep <= the merge_threshold "
+        "get_segment() will run with at inference (Sylber's default is 0.8)",
+    )
     p_ft.set_defaults(func=cmd_finetune)
 
     return parser
