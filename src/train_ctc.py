@@ -305,7 +305,16 @@ def cmd_train(args):
     out_ckpt = Path(args.out_ckpt or f"models/ctc_probe_{args.encoder}.pth")
     out_ckpt.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
-        {"head_state_dict": head.state_dict(), "char2id": char2id, "blank_id": blank_id, "encoder": args.encoder, "hidden_size": hidden_size},
+        {
+            "head_state_dict": head.state_dict(), "char2id": char2id, "blank_id": blank_id,
+            "encoder": args.encoder, "hidden_size": hidden_size,
+            # recorded so `compare` can reconstruct the exact same encoder
+            # config later without the caller having to remember/re-pass
+            # whatever thresholds this run used (e.g. sylber's --merge-threshold).
+            "checkpoint": args.checkpoint,
+            "norm_threshold": args.norm_threshold,
+            "merge_threshold": args.merge_threshold,
+        },
         out_ckpt,
     )
     log.info("Saved CTC probe head to %s", out_ckpt)
@@ -329,6 +338,105 @@ def cmd_train(args):
         )
     )
     log.info("Wrote results/downstream_eval/ctc_probe_%s.json (final val CER=%s)", args.encoder, final_cer)
+
+
+def cmd_compare(args):
+    """Fair comparison: restrict CER to the intersection of val utterances
+    that are CTC-viable (T>=L) for *every* requested, already-trained
+    encoder. Comparing raw final_val_cer numbers across encoders is biased
+    whenever their skip rates differ (e.g. Sylber's under-segmentation
+    skips utterances HuBERT doesn't) — the skipping encoder's CER ends up
+    measured only on its easier, pre-filtered subset. This loads each
+    encoder's already-trained `train_ctc.py train` checkpoint (no
+    retraining) and reports CER on a shared subset instead."""
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    df = pd.read_csv(args.manifest)
+    df["transcript"] = df["transcript"].fillna("")
+    val_df = df[df["split"] == "val"].reset_index(drop=True)
+    if val_df.empty:
+        raise ValueError(f"No rows with split=='val' in {args.manifest}")
+
+    from encoders import load_encoder
+
+    loaded = {}
+    for name in args.encoders:
+        ckpt_path = Path(args.ckpt_dir) / f"ctc_probe_{name}.pth"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"{ckpt_path} not found — run `train_ctc.py train --encoder {name}` first.")
+        ckpt = torch.load(ckpt_path, map_location=device)
+
+        encoder = load_encoder(
+            name, checkpoint=ckpt.get("checkpoint"), device=device,
+            norm_threshold=ckpt.get("norm_threshold"), merge_threshold=ckpt.get("merge_threshold"),
+        )
+        head = CTCHead(ckpt["hidden_size"], len(ckpt["char2id"])).to(device)
+        head.load_state_dict(ckpt["head_state_dict"])
+        head.eval()
+
+        loaded[name] = {"encoder": encoder, "head": head, "char2id": ckpt["char2id"], "blank_id": ckpt["blank_id"]}
+        log.info(
+            "Loaded %s from %s (checkpoint=%s norm_threshold=%s merge_threshold=%s)",
+            name, ckpt_path, ckpt.get("checkpoint"), ckpt.get("norm_threshold"), ckpt.get("merge_threshold"),
+        )
+
+    # Pass 1: per-encoder viability, caching features/labels for viable utterances only.
+    viable = {name: {} for name in loaded}
+    feats_cache = {name: {} for name in loaded}
+    labels_cache = {name: {} for name in loaded}
+    for _, row in tqdm(val_df.iterrows(), total=len(val_df), desc="checking viability"):
+        transcript = row["transcript"]
+        for name, m in loaded.items():
+            label_ids = [m["char2id"][c] for c in tokenize_transcript(transcript) if c in m["char2id"]]
+            feats = extract_features(m["encoder"], row["path"], device) if label_ids else None
+            ok = bool(label_ids) and feats is not None and feats.shape[0] >= len(label_ids)
+            viable[name][row["path"]] = ok
+            if ok:
+                feats_cache[name][row["path"]] = feats
+                labels_cache[name][row["path"]] = label_ids
+
+    common_paths = [p for p in val_df["path"] if all(viable[name].get(p, False) for name in loaded)]
+    log.info(
+        "Common val utterances CTC-viable for every requested encoder (%s): %d/%d",
+        list(loaded.keys()), len(common_paths), len(val_df),
+    )
+    if not common_paths:
+        raise RuntimeError("No val utterances are CTC-viable for every requested encoder — nothing to compare fairly.")
+
+    def cer_over(name: str, paths: list[str]) -> float:
+        m = loaded[name]
+        total_edits = total_ref = 0
+        with torch.no_grad():
+            for p in paths:
+                logits = m["head"](feats_cache[name][p])
+                pred_ids = greedy_ctc_decode(logits, m["blank_id"])
+                label_ids = labels_cache[name][p]
+                total_edits += edit_distance(pred_ids, label_ids)
+                total_ref += len(label_ids)
+        return total_edits / max(total_ref, 1)
+
+    results = {}
+    for name in loaded:
+        own_viable_paths = [p for p, ok in viable[name].items() if ok]
+        results[name] = {
+            "n_val_total": len(val_df),
+            "n_own_viable": len(own_viable_paths),
+            "cer_own_viable_subset": cer_over(name, own_viable_paths),
+            "n_common": len(common_paths),
+            "cer_common_subset": cer_over(name, common_paths),
+        }
+
+    log.info(
+        "Fair comparison (common subset = %d/%d val utterances viable for every encoder):\n%s",
+        len(common_paths), len(val_df), json.dumps(results, indent=2),
+    )
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps({"n_val_total": len(val_df), "n_common": len(common_paths), "results": results}, indent=2)
+    )
+    log.info("Wrote %s", out_path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -359,6 +467,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "default; see docs/post-benchmark-roadmap.md's 'Free lever found' section",
     )
     p_train.set_defaults(func=cmd_train)
+
+    p_compare = sub.add_parser(
+        "compare",
+        help="fair comparison: CER restricted to the intersection of val utterances CTC-viable for every "
+        "requested, already-trained encoder (see `train`) — avoids biasing the comparison toward "
+        "whichever encoder's under-segmentation filtered out more of the hard examples",
+    )
+    p_compare.add_argument("--manifest", required=True)
+    p_compare.add_argument("--encoders", nargs="+", default=["sylber", "hubert"], choices=["sylber", "hubert", "whisper"])
+    p_compare.add_argument("--ckpt-dir", default="models", help="directory containing ctc_probe_<encoder>.pth checkpoints from `train`")
+    p_compare.add_argument("--out", default="results/downstream_eval/ctc_probe_fair_comparison.json")
+    p_compare.add_argument("--device", default=None)
+    p_compare.set_defaults(func=cmd_compare)
 
     return parser
 

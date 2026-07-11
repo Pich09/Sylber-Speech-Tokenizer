@@ -216,6 +216,37 @@ Step 3 fine-tune on top. Even after the threshold fix, remember the CER
 itself still needs a much larger run to be trustworthy — this only fixes
 "can we compute a number at all," not "is the number meaningful yet."
 
+### Fair comparison: restrict CER to a shared subset, not each encoder's own
+
+Comparing `final_val_cer` numbers straight from `train_ctc.py train`'s
+per-encoder output is confounded whenever encoders skip different
+utterances — an encoder that discards more of the hard examples (like
+Sylber, even at `merge_threshold=0.98`, where 8/30 val utterances still
+fail `T≥L`) has its CER measured on an easier, pre-filtered subset than an
+encoder that skips nothing (HuBERT, 0/30 skipped here). `python
+src/train_ctc.py compare --encoders sylber hubert` (new command) fixes
+this: it loads both already-trained checkpoints (no retraining), finds the
+intersection of val utterances CTC-viable for *every* requested encoder,
+and reports CER on exactly that shared subset for each.
+
+Result (same 240/30 pilot, sylber at `merge_threshold=0.98`):
+
+| | own viable subset | CER (own subset) | CER (shared 22/30 subset) |
+|---|---|---|---|
+| sylber | 22/30 | 0.867 | 0.867 |
+| hubert | 30/30 | 0.985 | 0.985 |
+
+In this case HuBERT's CER barely moved when restricted to Sylber's
+easier subset (0.985→0.985) — its errors are fairly uniform across the
+val set, so the original unrestricted comparison happened not to be badly
+biased here. But that's a property of this specific run, not something to
+assume in general; **`compare` is what actually confirms it rather than
+hoping it's true**, and the result holds either way: Sylber beats HuBERT on
+a fair, identical-subset comparison at this pilot scale. Still not a
+trustworthy absolute number at only 240 train utterances/8 epochs — same
+caveat as before — but the *relative* comparison between the two encoders
+is now methodologically sound, not just numerically similar.
+
 ## Option B — Scale audio to match token count (fix the SLM comparison itself)
 
 If you still want the discrete-SLM/perplexity comparison to be a
